@@ -1,0 +1,15 @@
+# ADHD MRI project -- Phase 1 + Phase 2 (Steps 1-2) dependencies.
+# All of these are pre-installed on Kaggle's standard Python/GPU notebook
+# image; this file is provided for running outside Kaggle (local/other
+# cloud) or to pin versions if you hit an incompatibility.
+#
+# No version is hard-pinned beyond a practical floor: torch>=2.1 is required
+# for torch.utils.flop_counter.FlopCounterMode (used by the efficiency/FLOPs
+# audits in phase2_consistency.py, phase2_trm_ablation.py, and others).
+
+torch>=2.1
+numpy>=1.24
+pandas>=1.5
+scikit-learn>=1.2
+matplotlib>=3.6
+scipy>=1.10
