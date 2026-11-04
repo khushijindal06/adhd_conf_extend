@@ -11,6 +11,14 @@ real-data audit, and post-hoc analysis scripts.
 - [`code/`](code) — Phase 1 (baseline `ADHDNet` + ablations) and Phase 2,
   Steps 1–2 (pairwise Token Relationship Module, representation-consistency
   learning). See `code/README.md` for setup and run instructions.
+  - [`code/full_codebase.py`](code/full_codebase.py) — all 17 scripts
+    above, flattened verbatim into one file under `# FILE: code/...`
+    section headers, for single-file reading/supplementary submission.
+    **Reference only — do not run this file directly**: several of the
+    originals execute a full pipeline at module scope and reuse
+    config-constant/class names across files for different purposes, so
+    concatenated together they would collide. Run each script from
+    `code/` on its own, as `code/README.md` describes.
 - [`analysis/`](analysis) — read-only / inference-only scripts used by the
   audit:
   - `check_phenotype_leakage.py` — univariate AUROC + distribution checks
