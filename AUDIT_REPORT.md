@@ -6,16 +6,23 @@ the scripts in `code/`; items marked **PENDING** require the real-run
 artifacts (configs, result CSVs, prediction files, `processed_index.csv`)
 from the actual Kaggle run to complete.
 
+**Update:** the actual Kaggle notebook (and its real execution log for all
+896 subjects) has since been reviewed directly. Findings below are updated
+accordingly; items still marked **PENDING** need a fresh run of the newly
+added notebook cells (phenotype leakage check, M0/M1 embedding extraction,
+A2 MRI-only baseline) rather than code-level speculation.
+
 Reported real-data results under audit:
 
 | Model | Validation AUROC |
 |---|---|
-| Original ADHDNet (baseline) | 0.9516 |
+| Original ADHDNet (baseline, MRI+phenotype) | 0.9516 |
+| A3 — tokens+FastKAN, no TRM | 0.6930 |
 | A4 — conventional MHA TRM | 0.7019 |
 | A4-new — Pairwise TRM | 0.6973 |
 | A5-new — Pairwise TRM + anatomical attention | 0.6799 |
-| M0 — without consistency | 0.7394 |
-| M1 — with consistency | 0.7552 (higher cosine representation stability, lower ADHD sensitivity/F1) |
+| M0 — without consistency | 0.7394 (stability 0.4747 ± 0.5873) |
+| M1 — with consistency | 0.7552 (stability 0.9371 ± 0.1046, lower ADHD sensitivity/F1) |
 
 ## 1. Baseline comparability audit
 
@@ -64,17 +71,24 @@ on the real 896-subject data is the single highest-priority missing data
 point** before any Phase-3 discussion — it's the only apples-to-apples
 reference for A3/A4/A4-new/A5-new/M0/M1.
 
-**Split/preprocessing mechanics — identical by construction, identity not
-yet independently verified.** `train.py`, `ablation_study.py`,
-`phase2_trm_ablation.py`, and `phase2_consistency.py` all import the same
-`dataset.py`/`ADHDDataset` (same `.npy` loading, same flip-only
-augmentation, same normalization) and all build the split via
-`StratifiedShuffleSplit(test_size=0.2, random_state=42)` after the
-identical `site != 'Pittsburgh'` filter. This should produce bit-identical
-subject-ID splits across scripts — but only if `processed_index.csv`'s row
-order was unchanged between runs. **PENDING: diff the actual
-`train_subject_ids.csv`/`val_subject_ids.csv` files** from each script's
-output directory to confirm, rather than relying on "same seed" alone.
+**Split identity across stages — CONFIRMED from the real log.** The
+notebook's three stages reported matching val-set counts: Baseline
+(716 train/180 val, ADHD=70/Control=110), TRM (716/180, label dist.
+`{0: 110, 1: 70}`), Consistency (716/180, `{0: 110, 1: 70}`). TRM and
+Consistency additionally printed the **identical** dataset fingerprint —
+`index_hash=93bb5480ba9c... split_hash=e0343d42c716...` — cryptographic
+proof those two stages trained/evaluated on exactly the same 716 train /
+180 val subjects. (Note: the notebook version actually run does **not**
+filter out the Pittsburgh site — all three stages used the full,
+unfiltered 896 subjects — unlike the standalone `code/` package audited
+below, which does filter it. This is internally consistent across all
+three stages of the real run, just a difference from `code/`'s default.)
+Baseline's script has no fingerprinting of its own, but recomputes the
+identical `StratifiedShuffleSplit(test_size=0.2, random_state=42)` over
+the identical, unfiltered file — deterministic by construction given
+unchanged row order. **Recommended final check:** diff
+`baseline/val_index.csv`'s subject_id column against
+`trm/phase2/val_subject_ids.csv` directly, to remove all doubt.
 
 **Evaluation procedure — consistent, no leakage found.** `evaluate.py`
 correctly reuses `train.py`'s train-only `fit_stats.json` and exact saved
@@ -90,16 +104,15 @@ resume-safety guard Phase 2 now has.
 
 ## 2. Four TRM-variant audit
 
-From code (param counts verified via direct instantiation + parameter
-count, not yet checked against real-run artifacts — see pending asks
-below):
+Param counts verified via direct instantiation AND against the real
+notebook's own final aggregate table (identical in both):
 
-| Tag | `trm_type` | `use_attention` | Params |
-|---|---|---|---|
-| A3 tokens+FastKAN | `none` | False | 105,424 |
-| A4 +MHA TRM (Phase 1) | `mha` | False | 113,968 |
-| A4-new +Pairwise TRM | `pairwise` | False | 113,937 |
-| A5-new +Pairwise+AnatAttn | `pairwise` | True | 114,482 |
+| Tag | `trm_type` | `use_attention` | Params | Real AUROC |
+|---|---|---|---|---|
+| A3 tokens+FastKAN | `none` | False | 105,424 | 0.6930 |
+| A4 +MHA TRM (Phase 1) | `mha` | False | 113,968 | **0.7019** |
+| A4-new +Pairwise TRM | `pairwise` | False | 113,937 | 0.6973 |
+| A5-new +Pairwise+AnatAttn | `pairwise` | True | 114,482 | 0.6799 |
 
 All four share the identical `ADHDProposedModelV2` encoder/tokenizer/
 FastKAN/classifier head — only the relationship-module stage differs. A4's
@@ -109,31 +122,36 @@ FastKAN/classifier head — only the relationship-module stage differs. A4's
 clean "mechanism-only" ablation (near-identical param counts, 113,968 vs
 113,937).
 
-**The "A3/A4 labeling discrepancy" — most likely explanation.** The
-codebase defines "A3"/"A4" **three separate times**, for different
-things:
+**The "A3/A4 labeling discrepancy" — RESOLVED. It is a console-log
+artifact, not a data or training bug.** The real notebook's live
+per-variant progress block shows only **3** `===== header =====` blocks
+for 4 variants — the "A4 +MHA TRM (Phase 1)" header line is missing from
+the captured stream, so A4's own result line (`AUROC=0.7019,
+params=113,968`) prints directly under the **A3** header, creating the
+appearance that A3 produced that result. It did not: `main()`'s final
+aggregate table is built by reading each variant's own persisted
+`{tag}_results.csv` back from disk (not from in-memory loop state) and
+shows all four rows present and distinct, with parameter counts matching
+exactly what `VARIANTS` defines for each tag (table above) — internally
+consistent and matching the task's own summary numbers exactly (0.7019 =
+"Conventional MHA TRM" = A4; 0.6973 = "Pairwise TRM" = A4-new; 0.6799 =
+"+anatomical attention" = A5-new). The task's own top-level attribution
+was already correct; only the mid-run console text (one dropped header
+line, 3 lines) looked inconsistent. Separately: this explains why the
+codebase's three different "A3"/"A4"-numbered ablation studies
+(`ablation_study.py`, `proposed_ablation_study.py`,
+`phase2_trm_ablation.py` — detailed in the previous version of this
+report) were a plausible but, in the end, NOT the actual cause here;
+worth keeping in mind if a similar-looking discrepancy appears from a
+different log in the future.
 
-1. `ablation_study.py` (Phase-1 baseline ablations): A3 =
-   `ADHDNetConcatFusion`, A4 = `ADHDNetStandardConv` — about the original
-   ADHDNet's fusion/conv design, unrelated to TRMs.
-2. `proposed_ablation_study.py` (Phase-1 token architecture,
-   `ADHDProposedModel`): A3 = Tokens+FastKAN, A4 = +TRM (the original MHA
-   TRM).
-3. `phase2_trm_ablation.py` (Phase-2 Step 1, `ADHDProposedModelV2`): A3 =
-   tokens+FastKAN, A4 = +MHA TRM (a deliberate re-verification control
-   reusing #2's module), A4-new/A5-new = the actual new contributions.
-
-Scripts #2 and #3 define nearly-identical A3/A4 *by design* (so #3 can
-confirm #2's numbers transfer to the new wrapper) — but they're separate
-model classes, separate checkpoints, separate output directories. **If the
-real execution log shows two different AUROCs or param counts both
-labeled "A3" or "A4," it is almost certainly because the log merges output
-from two of these three scripts under the same short label**, not a bug in
-either script.
-
-**PENDING to finish verification against the real run:** `A3_config.json`,
-`A4_config.json`, `A4-new_config.json`, `A5-new_config.json`,
-`trm_ablation_results.csv`, and the four `*_val_predictions.csv` files.
+`run_sanity_check()` was skipped on this real run (`--code-sanity` not
+passed), so its Test A — which asserts each tag's parameter count against
+`expected_params = {'A3': 105424, 'A4': 113968, 'A4-new': 113937,
+'A5-new': 114482}` before any real training starts — did not get a
+chance to catch/confirm this ahead of time. Recommend enabling
+`--code-sanity` on the next run for the extra guard (synthetic data only,
+near-zero added cost).
 
 ## 3. Consistency-learning diagnostics (M0 vs M1)
 
@@ -162,15 +180,26 @@ subject's 128-d representation via the model's own existing
   within/between separation gap, and mean within-subject stability.
 
 Verified end-to-end against synthetic checkpoints before being handed off
-(see `analysis/` script docstring); **PENDING: run against the real
+(see `analysis/` script docstring), and a notebook-adapted copy has been
+added directly to the real Kaggle notebook (see below) — re-verified
+end-to-end against that notebook's own module code before being added.
+**PENDING: run the added cell against the real
 `best_m0_model.pt`/`best_m1_model.pt`.**
 
-A pattern worth watching once real numbers are in: M1's lower
-sensitivity/F1 alongside higher stability is the textbook signature of
-representation collapse — stability rising while between-class separation
-(part (b)'s between-class similarity, and part (a)'s AUPRC/sensitivity)
-falls together. These diagnostics are designed to distinguish "collapsed
-toward one point" from "legitimately smoother but still discriminative."
+**Real numbers already visible from the log, worth flagging now:** M0's
+own within-subject stability is 0.4747 ± 0.5873 — a standard deviation
+roughly as large as the mean, meaning M0's representations are themselves
+quite unstable under `consistency_augment()` perturbation (expected,
+since M0 was never trained to resist it). M1's is 0.9371 ± 0.1046 — both
+a much higher mean AND a much tighter spread. That gain is real and
+substantial, not noise. The open question this report flagged is whether
+M1's accompanying sensitivity/F1 drop (0.4429/0.5345 vs M0's 0.7286/
+0.6415) reflects genuine representation collapse (discriminative
+information traded away for stability) or is confined to the decision
+threshold — M1's lower sensitivity/F1 alongside much higher stability is
+the textbook signature to check for collapse, and the newly-run
+embedding diagnostics (effective rank, within- vs between-class
+separation gap) are what will answer it directly.
 
 ## 4. Proposed controlled MRI-only comparison (design only — not executed)
 
@@ -197,26 +226,30 @@ Step-1 variants.
   existing loop structure (no architecture change, just swap the model
   class in).
 - Leave-one-site-out: reuse `cross_site_eval.py`'s existing pattern,
-  restricted to sites where `site_label_counts.csv` (already produced by
-  the Phase-2 scripts) shows both classes present with a usable minimum
-  count (suggested floor: ≥5 per class). **PENDING: the real
-  `site_label_counts.csv`** to confirm which sites qualify.
+  restricted to sites where both classes are present in a usable count.
+  **CONFIRMED from the real `site_label_counts.csv`**: KKI, NYU,
+  NeuroIMAGE, OHSU, Peking_1, Peking_2, Peking_3 all have both classes in
+  double digits on both the train and val side — **7 eligible sites**.
+  Pittsburgh (train: 63 control/2 ADHD; val: 19 control/2 ADHD) and WashU
+  (47 control/0 ADHD everywhere) do not have a usable ADHD count and
+  should be excluded.
 - Reduced per-fold budget (matching `cross_validate.py`'s own convention):
   `EPOCHS=60, PATIENCE=10`, vs. the `150/15` used for the single-split
   headline numbers.
 
-**Compute requirements (estimate — needs calibration):**
-- Training runs: 7 models × 10 CV folds = 70, + 7 models × ~4 eligible
-  sites = 28 → **~98 total training runs**.
-- Parametric estimate only (no access to real per-epoch timing): this
-  model is tiny (~114K params, 0.2 GFLOPs) on 64³ volumes — on a Kaggle
-  T4/P100, roughly 2–5 s/epoch, ~30–40 epochs/run typical early-stopping
-  point → **~3–6 GPU-hours total**; CPU would likely be 10–20× that and
-  impractical for the full grid. **PENDING: actual per-epoch time from the
-  existing single-split runs** (visible in `training_history_*.csv`
-  timestamps) to replace this estimate with a real number. Recommend
-  piloting with `n_repeats=1` (35 runs instead of 98) first to confirm
-  timing before committing to the full repeated design.
+**Compute requirements:**
+- Training runs: 7 models × 10 CV folds = 70, + 7 models × 7 eligible
+  sites = 49 → **119 total training runs** (revised up from the earlier
+  ~98 estimate now that the real site breakdown gives 7 eligible sites,
+  not ~4).
+- From the real run's own per-variant timings (Step-1 variants: 177–329s
+  at their observed early-stopping points of 23–43 epochs out of a 150
+  max; baseline took 101 epochs end to end) — roughly 3–8 s/epoch
+  observed — at a conservative ~3s/epoch and a typical ~30-epoch early
+  stop, that's **~3 GPU-hours** for the full 119-run matrix on the same
+  GPU this notebook already ran on. Recommend piloting with `n_repeats=1`
+  (49 CV runs instead of 70) first to confirm timing before committing to
+  the full repeated design.
 
 ## 5. Preservation
 
@@ -228,16 +261,38 @@ proposed. Phase 3 has not been started.
 
 ## Outstanding items to close this audit
 
-1. Run `analysis/check_phenotype_leakage.py` against the real
-   `processed_index.csv` and record the result here.
-2. Run `code/ablation_study.py`'s A2 (`ADHDNetMRIOnly`) on the real data —
-   the missing fair MRI-only baseline.
-3. Share: the four Step-1 `*_config.json` + `trm_ablation_results.csv` +
-   `*_val_predictions.csv`; `val_predictions_m0.csv`/`val_predictions_m1.csv`;
-   `site_label_counts.csv`; the raw execution-log excerpt showing the
-   apparent A3/A4 discrepancy.
-4. Run `analysis/extract_representations_m0_m1.py` against the real
-   `best_m0_model.pt`/`best_m1_model.pt` checkpoints.
-5. Decide Tier-2 scope (minimal: 1 new A5-new run vs. full: retrain all
-   four Step-1 variants under `augment=False`) and approve the CV/LOSO
-   compute budget before execution.
+The actual Kaggle notebook has been reviewed (its 8508fc5/967af49-era
+version here now has 8 new cells appended covering items 1, 3, and 5
+below as runnable-but-not-yet-run cells — see "Notebook" below). Status:
+
+1. **DONE** — A3/A4 labeling discrepancy: resolved (§2 above), console-log
+   artifact, not a data bug.
+2. **DONE** — Split identity across stages: confirmed via matching
+   fingerprint hashes (TRM vs Consistency) and matching counts (vs
+   Baseline) (§1 above).
+3. **DONE** — Leave-one-site-out eligible sites: confirmed from the real
+   `site_label_counts.csv` — 7 sites qualify, not ~4 (§4 above).
+4. **PENDING** — Run the phenotype-leakage-check cell (now added to the
+   notebook) against the real `processed_index.csv` and record the
+   result here.
+5. **PENDING** — Run `_adhd200_combined_ablation_study.py`'s A2
+   (`ADHDNetMRIOnly`) on the real data — the missing fair MRI-only
+   baseline (cell added to the notebook with run instructions, not
+   auto-run).
+6. **PENDING** — Run the M0/M1 embedding-extraction cell (now added to
+   the notebook) against the real `best_m0_model.pt`/`best_m1_model.pt`.
+7. **PENDING** — Decide Tier-2 scope (minimal: 1 new A5-new run vs. full:
+   retrain all four Step-1 variants under `augment=False`) and approve
+   the revised 119-run CV/LOSO compute budget before execution.
+
+## Notebook
+
+The actual Kaggle notebook this run came from has 8 new cells appended
+(all 26 original cells and their outputs left untouched): an "Audit
+findings from this run" markdown cell with the resolved findings above,
+the phenotype-leakage-check script + its runner, the M0/M1
+embedding-extraction script + its runner, a note on how to run the A2
+MRI-only baseline, and the Item 4 design/compute-budget writeup. Delivered
+directly to the user as a file (not committed here, since it contains
+this run's actual Kaggle paths and is a working notebook rather than
+package source) — ask the user for it if you need to see the exact cells.
