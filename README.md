@@ -19,6 +19,14 @@ real-data audit, and post-hoc analysis scripts.
     config-constant/class names across files for different purposes, so
     concatenated together they would collide. Run each script from
     `code/` on its own, as `code/README.md` describes.
+  - [`code/full_codebase_notebook.py`](code/full_codebase_notebook.py) —
+    the *other* codebase: all 20 `_adhd200_combined_*.py` files the real
+    Kaggle notebook (`adhd200_notebook_updated.ipynb`) writes via
+    `%%writefile` — the actual modules that produced the real results in
+    `AUDIT_REPORT.md` — flattened the same way. **Reference only**: each
+    section starts with its own `%%writefile` magic line (paste each into
+    its own notebook cell), so this file isn't valid plain Python on its
+    own either.
 - [`analysis/`](analysis) — read-only / inference-only scripts used by the
   audit:
   - `check_phenotype_leakage.py` — univariate AUROC + distribution checks
