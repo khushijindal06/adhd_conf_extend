@@ -28,5 +28,12 @@ real-data audit, and post-hoc analysis scripts.
     representations from the trained M0/M1 checkpoints and computes
     collapse/discriminability diagnostics, without any training or
     architecture change.
+  - [`notebook_cells_full.py`](analysis/notebook_cells_full.py) — the
+    notebook-specific versions of the two scripts above (adapted import
+    style, matching the real Kaggle notebook's `_adhd200_combined_*`
+    naming convention), flattened into one file under per-cell section
+    headers. Each section starts with a `%%writefile` Jupyter magic line
+    and is meant to be pasted into its own notebook cell, not run as a
+    plain script — see the file's own header.
 
 Architecture is frozen pending the audit's review. Phase 3 has not started.
