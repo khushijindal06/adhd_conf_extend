@@ -12,6 +12,18 @@ accordingly; items still marked **PENDING** need a fresh run of the newly
 added notebook cells (phenotype leakage check, M0/M1 embedding extraction,
 A2 MRI-only baseline) rather than code-level speculation.
 
+**Update 2:** a separate audit module, `code/experimental_audit.py`, now
+implements every audit utility described below as executable code
+(baseline-input introspection, split-identity verification, TRM-variant
+verification, log-consistency checking, calibration/ROC-PR/embedding
+diagnostics, and a repeated-CV + leave-one-site-out controlled-comparison
+harness covering all 7 models). It has been tested with synthetic data
+only (11 tests, A-K, all passing — see
+`experimental_audit_sanity_output.txt`) and has **not** been run against
+real data or real compute. See "Which analyses need existing checkpoints
+vs. new training" at the end of this report for exactly what each piece
+needs to produce real numbers.
+
 Reported real-data results under audit:
 
 | Model | Validation AUROC |
@@ -220,6 +232,21 @@ Step-1 variants.
 | 1 — mechanism ablation | Original MRI-only (A2), A3, A4, A4-new, A5-new | `True` (existing results, no rerun needed) | Which relationship module is best, holding everything else fixed |
 | 2 — objective ablation | A5-new (new run), M0, M1 | `False` | Does the consistency loss help, on top of the best mechanism from Tier 1 |
 
+**Now implemented, not just designed.** `code/experimental_audit.py`'s
+`MODEL_SPECS` dict and `run_controlled_comparison()` function implement
+exactly this design as runnable code: all 7 models (`baseline_mri_only`
+→ `ADHDNetMRIOnly`, `A3`/`A4`/`A4-new`/`A5-new`/`M0` → `ADHDProposedModelV2`
+with the matching `trm_type`/`use_attention`, `M1` → the same plus the
+two-view consistency loss, imported unmodified from
+`phase2_consistency.py`), each trained with its own correct
+`augment` setting, through one shared, fingerprint-guarded, resumable
+`train_one_fold()` trainer. `build_loso_folds()` excludes any site
+below a configurable per-class minimum (default 5; verified in
+synthetic Test I/J to correctly exclude a single-class site). Verified
+end-to-end on synthetic data (Test K trains all 7 specs for one fold
+each; Test J runs the full CV+LOSO orchestration for one model) — **not
+yet run on real data.**
+
 **Evaluation protocol per model:**
 - Repeated stratified CV: `RepeatedStratifiedKFold(n_splits=5, n_repeats=2,
   random_state=42)` → 10 folds/model, reusing `cross_validate.py`'s
@@ -256,8 +283,41 @@ Step-1 variants.
 Nothing in this audit read, modified, or deleted any checkpoint, CSV, or
 figure from the real run — this is static code review of the package in
 `code/`, plus two proposed (inference-only / read-only) scripts in
-`analysis/`. No architecture or model-module changes were made or
-proposed. Phase 3 has not been started.
+`analysis/`, plus `code/experimental_audit.py` (see below), tested only
+against synthetic data in its own temp directories. No architecture or
+model-module changes were made or proposed. Phase 3 has not been started.
+
+## Which analyses need existing checkpoints vs. new training
+
+Per-function breakdown of `code/experimental_audit.py` (all 11 synthetic
+tests, A-K, pass — see `experimental_audit_sanity_output.txt`):
+
+**Read-only / inference-only — run on EXISTING checkpoints and files,
+no training:**
+
+| Function | Needs |
+|---|---|
+| `audit_baseline_inputs()` | nothing — pure code introspection, already run (§1 above) |
+| `verify_split_identity()` | existing `val_index.csv` / `val_subject_ids.csv` files |
+| `verify_trm_variant()` / `verify_all_trm_variants()` | existing `{tag}_config.json` + `{tag}_best_model.pt` + `{tag}_results.csv` |
+| `check_log_header_result_alignment()` | the raw console log text (already resolved the real A3/A4 case by hand in §2; this makes it a reusable, automatic check for next time) |
+| `roc_pr_comparison()`, `probability_distributions()`, `per_class_metrics()` | existing `val_predictions_{m0,m1}.csv` |
+| `calibration_metrics()` + `plot_reliability_diagram()` | existing `val_predictions_{m0,m1}.csv` |
+| `extract_val_embeddings()`, `within_subject_stability()`, `between_subject_similarity()`, `representation_quality_report()` | existing `best_m0_model.pt`/`best_m1_model.pt` + the saved train/val subject-ID split — one frozen forward pass per subject, no gradient, no architecture change (this is the "implement that functionality so it can run on existing checkpoints without retraining" ask, directly) |
+
+**Requires NEW training — not run by this module on its own:**
+
+| Function | What it would train |
+|---|---|
+| `prepare_mri_only_baseline_run()` → `run_controlled_comparison(model_names=['baseline_mri_only'])` | the missing fair MRI-only baseline (A2) — 1 run on the real 896 subjects |
+| `run_controlled_comparison()` (full) | the 119-fold repeated-CV + LOSO matrix across all 7 models — ~3 GPU-hours estimated (§4 above) |
+
+Everything in the first table can produce real numbers for this audit
+**today**, from files that already exist on the Kaggle output, with zero
+additional compute. Everything in the second table is implemented and
+synthetic-tested but is new, real, GPU training and was deliberately
+**not** run here, per the instruction not to run expensive experiments
+yet.
 
 ## Outstanding items to close this audit
 

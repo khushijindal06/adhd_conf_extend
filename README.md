@@ -6,8 +6,10 @@ real-data audit, and post-hoc analysis scripts.
 - [`AUDIT_REPORT.md`](AUDIT_REPORT.md) — audit of the initial real-data
   results (896 subjects) before starting Phase 3: baseline comparability,
   TRM-variant verification, consistency-learning diagnostics, and a
-  proposed controlled MRI-only comparison design. Several items are marked
-  **PENDING** real-run artifacts — see "Outstanding items" at the end.
+  controlled MRI-only comparison design (now implemented as code — see
+  `code/experimental_audit.py` below). Several items are marked
+  **PENDING** real-run artifacts — see "Outstanding items" and "Which
+  analyses need existing checkpoints vs. new training" at the end.
 - [`code/`](code) — Phase 1 (baseline `ADHDNet` + ablations) and Phase 2,
   Steps 1–2 (pairwise Token Relationship Module, representation-consistency
   learning). See `code/README.md` for setup and run instructions.
@@ -27,6 +29,18 @@ real-data audit, and post-hoc analysis scripts.
     section starts with its own `%%writefile` magic line (paste each into
     its own notebook cell), so this file isn't valid plain Python on its
     own either.
+  - [`code/experimental_audit.py`](code/experimental_audit.py) — the
+    separate experimental audit module: baseline-input introspection,
+    split-identity verification, TRM-variant/checkpoint cross-checking,
+    a reusable log-consistency checker, calibration/ROC-PR/embedding
+    diagnostics, and a repeated-CV + leave-one-site-out controlled
+    comparison harness covering all 7 models (`baseline_mri_only`, A3,
+    A4, A4-new, A5-new, M0, M1). Imports the existing model classes and
+    training utilities unmodified; defines no new model. `python
+    experimental_audit.py` runs its synthetic-only sanity suite (11
+    tests, A-K — see
+    [`experimental_audit_sanity_output.txt`](experimental_audit_sanity_output.txt)).
+    Has not been run against real data.
 - [`analysis/`](analysis) — read-only / inference-only scripts used by the
   audit:
   - `check_phenotype_leakage.py` — univariate AUROC + distribution checks

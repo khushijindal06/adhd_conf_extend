@@ -1,0 +1,67 @@
+Device : cpu
+======================================================================
+  EXPERIMENTAL AUDIT MODULE -- SYNTHETIC SANITY CHECKS
+======================================================================
+
+  Test A -- baseline input audit (introspection, not prose):
+    ADHDNet multimodal=True  ADHDNetMRIOnly multimodal=False  ADHDProposedModelV2(default) multimodal=False
+  TEST A PASSED
+
+  Test B -- split identity verification (matching vs mismatched subject sets):
+    matching stage correctly identical: True  mismatched stage correctly flagged: True
+  TEST B PASSED
+
+  Test C -- TRM variant verification against a real (synthetic-data) training run:
+Device : cpu
+    A3's own real training-run artifacts all cross-check consistent: True
+    Deliberately mislabeled config correctly caught: config_kwargs_match_expected=False
+  TEST C PASSED
+
+  Test D -- log header/result alignment (the real run's A3/A4 artifact, reproduced):
+    Clean log: likely_console_log_artifact=False  Broken log (header dropped): likely_console_log_artifact=True, headers_missing=['A4 +MHA TRM (Phase 1)']
+  TEST D PASSED
+
+  Test E -- calibration metrics (ECE, Brier) + reliability diagram:
+    ECE(well-separated)=0.0500 < ECE(constant 0.9)=0.3800: True  reliability diagram written: True
+  TEST E PASSED
+
+  Test F -- ROC/PR comparison, probability distributions, per-class metrics:
+    AUROC=1.0000  AUPRC=1.0000  sensitivity=1.0000  specificity=0.9655
+  TEST F PASSED
+
+  Test G -- embedding extraction + collapse diagnostics (inference-only, no training):
+    embeddings shape=(12, 128)  effective_rank=8.59  class_separation_gap=0.0000  within_subject_stability=1.0000
+  TEST G PASSED
+
+  Test H -- fold trainer: fresh run, skip-if-complete, fingerprint guards:
+    Fresh run: status=fresh  Rerun (identical config): status=skipped
+    Changed index_hash correctly REFUSED: [testfold] REFUSING to reuse a fold result -- configuration has changed since it was produced:
+    Missing config_fingerprint correctly REFUSED: [testfold] REFUSING to reuse -- /tmp/exp_audit_foldout_tzmhot8n/testfold_config.json has no config_fingerprint (predates this safeguard, or was produced by a different module version), so there is no way to verify it matches the current configuration. Point OUT_DIR at a fresh, empty directory.
+  TEST H PASSED
+
+  Test I -- repeated-CV fold count + LOSO single-class-site exclusion:
+    6 CV folds (expected 6), LOSO sites included: ['loso_SiteA', 'loso_SiteB'], skipped (single-class): ['SiteOneClass']
+  TEST I PASSED
+
+  Test J -- run_controlled_comparison() end-to-end (tiny synthetic data, 1 model, 1 epoch):
+  2 repeated-CV folds + 2 LOSO folds (1 sites skipped for too few of one class: ['SiteOneClass'])
+    4 total folds run (expected 4), all fresh, SiteOneClass correctly excluded from LOSO
+    Summary:
+model_name     mean      std  count
+        A3 0.480655 0.196301      4
+  TEST J PASSED
+
+  Test K -- every model spec (all 7) trains one fold end-to-end:
+    baseline_mri_only    params= 28,896  auroc=1.0000  status=fresh
+    A3                   params=105,424  auroc=0.5000  status=fresh
+    A4                   params=113,968  auroc=0.0000  status=fresh
+    A4-new               params=113,937  auroc=0.7500  status=fresh
+    A5-new               params=114,482  auroc=0.7500  status=fresh
+    M0                   params=114,482  auroc=0.7500  status=fresh
+    M1                   params=114,482  auroc=0.7500  status=fresh
+  TEST K PASSED
+
+======================================================================
+  ALL SYNTHETIC SANITY CHECKS (A-K) PASSED ✓
+======================================================================
+  (No real dataset was loaded, nothing under baseline/, phase2/, or phase2/consistency/ was read or written. Section 4's harness is now implemented and unit-tested, but has NOT been run on real data.)

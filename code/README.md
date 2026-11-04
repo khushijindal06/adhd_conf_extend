@@ -128,8 +128,10 @@ cross-validation/cross-site evaluation. `generate_architecture_figure.py`
 | `phase2_model.py` | **Step 1**: pairwise Token Relationship Module + `ADHDProposedModelV2` |
 | `phase2_trm_ablation.py` | **Step 1**: A3/A4/A4-new/A5-new TRM comparison |
 | `phase2_consistency.py` | **Step 2**: representation-consistency learning (M0 vs M1) |
+| `experimental_audit.py` | **Experimental audit module** (separate, read-only + new-training utilities): baseline-input audit, TRM-variant verification, calibration/ROC-PR/embedding diagnostics, and a repeated-CV + leave-one-site-out controlled-comparison harness covering all 7 models. Imports the model classes and training utilities above unmodified -- defines no new model. Run `python experimental_audit.py` for its synthetic-only sanity suite (A-K); see `../AUDIT_REPORT.md` for what each function needs to run on real data. |
 
 ## Status
 
-Ready for the real-data Step-2 (M0/M1) run. See the chat report accompanying
-this package for the full verification results.
+Ready for the real-data Step-2 (M0/M1) run. See `../AUDIT_REPORT.md` for
+the full audit of the real-data results and `experimental_audit.py` for
+the audit utilities built on top of it.
