@@ -43,7 +43,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 from sklearn.metrics import (roc_auc_score, average_precision_score, roc_curve,
                               precision_recall_curve, confusion_matrix, brier_score_loss)
 
@@ -457,7 +457,14 @@ def extract_val_embeddings(model, val_ds, batch_size=BATCH_SIZE):
     frozen forward pass (model.eval(), torch.no_grad()) through the
     model's own, unmodified encode_representation(). No gradient, no
     optimizer, no architecture change.
+
+    `model` is moved to DEVICE here defensively (idempotent if it's
+    already there) -- this function is meant to be callable directly
+    against a freshly-loaded checkpoint, not only through
+    representation_quality_report(), so it must not assume the caller
+    remembered to do so.
     """
+    model = model.to(DEVICE)
     model.eval()
     subject_ids = val_ds.df['subject_id'].tolist()
     labels = val_ds.labels.tolist()
@@ -477,8 +484,10 @@ def within_subject_stability(model, val_ds, n_repeats=5, stability_seed=12345, b
     """Item 3, bullet 4 (within-subject half): per-subject
     cos(z(original), z(consistency_augment(original))) -- same design as
     phase2_consistency.py's measure_representation_stability(), kept
-    per-subject instead of collapsed to one mean."""
+    per-subject instead of collapsed to one mean. `model` is moved to
+    DEVICE defensively, same reasoning as extract_val_embeddings()."""
     set_seed(stability_seed)
+    model = model.to(DEVICE)
     model.eval()
     subject_ids = val_ds.df['subject_id'].tolist()
     labels = val_ds.labels.tolist()
@@ -526,6 +535,163 @@ def between_subject_similarity(embeddings, labels):
     )
 
 
+def _cv_centroid_projection_auc(embeddings, labels, n_folds=5, seed=0):
+    """
+    Out-of-sample linear-centroid-projection AUC: fits the (centroid_1 -
+    centroid_0) axis on a TRAIN fold only, scores a held-out fold with
+    it, repeated across stratified folds and pooled. This avoids the
+    in-sample optimism of fitting AND scoring the discriminant axis on
+    the same data -- which is severely inflated whenever the embedding
+    dimension is comparable to or larger than the sample size (exactly
+    the regime these 128-d checkpoints run in: e.g. ~180 real validation
+    subjects vs. 128 dimensions). An in-sample version of this check was
+    caught producing a near-1.0 AUC on two classes drawn from the
+    IDENTICAL distribution during this module's own testing (Test L) --
+    this cross-validated version is the fix.
+    """
+    labels = np.asarray(labels)
+    n_min_class = min((labels == 0).sum(), (labels == 1).sum())
+    n_folds = max(2, min(n_folds, int(n_min_class)))
+    if n_min_class < 2:
+        return None
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    all_true, all_score = [], []
+    for train_idx, test_idx in skf.split(embeddings, labels):
+        train_emb, train_lab = embeddings[train_idx], labels[train_idx]
+        if (train_lab == 0).sum() == 0 or (train_lab == 1).sum() == 0:
+            continue
+        mu0 = train_emb[train_lab == 0].mean(axis=0)
+        mu1 = train_emb[train_lab == 1].mean(axis=0)
+        axis_unit = (mu1 - mu0) / (np.linalg.norm(mu1 - mu0) + 1e-12)
+        all_true.extend(labels[test_idx].tolist())
+        all_score.extend((embeddings[test_idx] @ axis_unit).tolist())
+    if len(set(all_true)) < 2:
+        return None
+    return float(roc_auc_score(all_true, all_score))
+
+
+def representation_collapse_diagnostics(embeddings, labels):
+    """
+    Distinguishes GLOBAL EMBEDDING ALIGNMENT (every representation pulled
+    toward a similar shared direction/region, which mechanically inflates
+    BOTH within- and between-class raw pairwise cosine similarity
+    together) from GENUINE CLASS-DISCRIMINATION LOSS (the class-relevant
+    signal itself destroyed). Five complementary views, as requested:
+
+      1. raw pairwise cosine similarity (within vs between class) --
+         same numbers between_subject_similarity() reports.
+      2. CENTERED pairwise cosine similarity -- subtract the GLOBAL mean
+         embedding from every sample first, removing any shared "DC"
+         direction common to all embeddings, before computing cosine
+         similarity. A shared direction inflates raw cosine similarity
+         for every pair equally (within- and between-class alike); it
+         does not depend on class and disappears once centered.
+      3. class-CENTROID separation -- Euclidean distance and cosine
+         similarity between the two classes' mean embeddings, plus a
+         Fisher-like ratio (centroid distance / average within-class
+         spread) that is scale- and shift-invariant -- adding a constant
+         shift to every embedding does not move the centroids apart or
+         together.
+      4. embedding NORMS per class -- rules out "collapsed toward the
+         origin" (near-zero vectors, where cosine similarity is
+         numerically dominated by noise) as a trivial alternative
+         explanation for a high raw between-class similarity.
+      5. a CROSS-VALIDATED linear centroid-projection AUC -- fit the
+         (centroid_1 - centroid_0) axis on a train fold only, score a
+         held-out fold with it (via _cv_centroid_projection_auc(),
+         stratified k-fold, pooled), same metric as the model's own
+         classification AUROC. Deliberately NOT fit-and-scored on the
+         same samples: an in-sample version of this was caught by this
+         module's own Test L producing a near-1.0 AUC on two classes
+         drawn from the IDENTICAL distribution (pure sampling noise in a
+         ~128-dimensional space with a finite sample looks separable if
+         you evaluate the discriminant on the data that defined it) --
+         exactly the regime these checkpoints' 128-d embeddings run in
+         (e.g. ~180 real validation subjects). Shift-invariant, like the
+         centroid stats above. If this stays high (not near 0.5) even
+         while raw between-class cosine similarity looks "collapsed",
+         the class-relevant signal has NOT been destroyed -- it has
+         simply stopped dominating the embedding's overall shared
+         direction (global alignment), and a simple linear readout can
+         still recover it out-of-sample.
+    """
+    embeddings = np.asarray(embeddings, dtype=float)
+    labels = np.asarray(labels)
+    n = len(labels)
+
+    raw = between_subject_similarity(embeddings, labels)
+
+    centered = embeddings - embeddings.mean(axis=0, keepdims=True)
+    centered_cos_mat = pairwise_cosine_matrix(centered)
+    iu = np.triu_indices(n, k=1)
+    same_class = labels[iu[0]] == labels[iu[1]]
+    centered_within = centered_cos_mat[iu][same_class]
+    centered_between = centered_cos_mat[iu][~same_class]
+
+    has_both_classes = (labels == 0).any() and (labels == 1).any()
+    centroid_report = dict(euclidean_distance=None, cosine_similarity=None,
+                            within_class_spread=None, fisher_like_ratio=None)
+    projection_auc = None
+    if has_both_classes:
+        mu0 = embeddings[labels == 0].mean(axis=0)
+        mu1 = embeddings[labels == 1].mean(axis=0)
+        centroid_euclidean_distance = float(np.linalg.norm(mu0 - mu1))
+        centroid_cosine_similarity = float(
+            (mu0 @ mu1) / (np.linalg.norm(mu0) * np.linalg.norm(mu1) + 1e-12))
+        spreads = [np.linalg.norm(embeddings[labels == c] - embeddings[labels == c].mean(axis=0),
+                                   axis=1).mean() for c in (0, 1)]
+        within_class_spread = float(np.mean(spreads))
+        centroid_report = dict(
+            euclidean_distance=centroid_euclidean_distance,
+            cosine_similarity=centroid_cosine_similarity,
+            within_class_spread=within_class_spread,
+            fisher_like_ratio=centroid_euclidean_distance / (within_class_spread + 1e-12),
+        )
+        try:
+            projection_auc = _cv_centroid_projection_auc(embeddings, labels)
+        except Exception:
+            projection_auc = None
+
+    norms = np.linalg.norm(embeddings, axis=1)
+    norm_stats = dict(
+        overall_mean_norm=float(norms.mean()), overall_std_norm=float(norms.std()),
+        control_mean_norm=(float(norms[labels == 0].mean()) if (labels == 0).any() else None),
+        adhd_mean_norm=(float(norms[labels == 1].mean()) if (labels == 1).any() else None),
+    )
+
+    return dict(
+        raw_pairwise=dict(
+            within_class=float(raw['mean_pairwise_cosine_within_class']),
+            between_class=float(raw['mean_pairwise_cosine_between_class']),
+            gap=float(raw['class_separation_gap']),
+        ),
+        centered_pairwise=dict(
+            within_class=float(centered_within.mean()),
+            between_class=float(centered_between.mean()),
+            gap=float(centered_within.mean() - centered_between.mean()),
+        ),
+        centroid_separation=centroid_report,
+        embedding_norms=norm_stats,
+        linear_centroid_projection_auc=projection_auc,
+        interpretation=(
+            "If raw_pairwise shows high between-class similarity and a small gap, but "
+            "centered_pairwise's gap is much closer to (or larger than) the raw gap, most "
+            "of the apparent collapse is a shared GLOBAL direction common to every "
+            "embedding (global alignment), not loss of class information -- centering "
+            "removes the shared direction and recovers the real separation. "
+            "fisher_like_ratio is scale- and shift-invariant: a value comparable to "
+            "another model's despite very different raw cosine numbers means the classes "
+            "are equally separable relative to their own spread in both cases. "
+            "linear_centroid_projection_auc (cross-validated -- the discriminant axis is "
+            "fit on a train fold and scored on a held-out fold, never the same samples) "
+            "close to the model's own classification AUROC (not close to 0.5) means a "
+            "simple linear readout can still recover the class label from the embedding "
+            "OUT OF SAMPLE -- the discriminative signal survived, even if it no longer "
+            "dominates the embedding's overall shape."
+        ),
+    )
+
+
 def representation_quality_report(model, val_ds, val_predictions_csv=None, tag='model'):
     """
     Combines item 3 for ONE checkpoint: embedding-level diagnostics
@@ -536,6 +702,7 @@ def representation_quality_report(model, val_ds, val_predictions_csv=None, tag='
     embeddings, subject_ids, labels = extract_val_embeddings(model, val_ds)
     stability_df = within_subject_stability(model, val_ds)
     between_report = between_subject_similarity(embeddings, labels)
+    collapse_report = representation_collapse_diagnostics(embeddings, labels)
     report = dict(
         tag=tag,
         embedding=dict(
@@ -543,6 +710,7 @@ def representation_quality_report(model, val_ds, val_predictions_csv=None, tag='
             mean_within_subject_stability=float(stability_df['cos_mean'].mean()),
             std_within_subject_stability=float(stability_df['cos_mean'].std()),
         ),
+        collapse_diagnostics=collapse_report,
     )
     if val_predictions_csv and os.path.isfile(val_predictions_csv):
         df = pd.read_csv(val_predictions_csv)
@@ -581,6 +749,44 @@ MODEL_SPECS = {
 
 def _build_model(spec):
     return spec['model_cls'](**spec['kwargs']).to(DEVICE)
+
+
+def verify_phenotype_blindness(model_name_or_spec, batch_size=4, vol_shape=(1, 64, 64, 64)):
+    """
+    Item 3: a BEHAVIORAL (not just structural) proof that a given model
+    spec is genuinely MRI-only. document_model_inputs() already confirms
+    structurally that ADHDNetMRIOnly/ADHDProposedModelV2(use_phenotype=
+    False) have no pheno_mlp submodule at all -- this goes one step
+    further and proves the model's OUTPUT is actually invariant to the
+    phenotype tensor's contents: builds the model fresh, runs the SAME
+    random MRI volume through it twice with two wildly different,
+    randomly-drawn phenotype tensors (standing in for age/sex/med_status/
+    site_id/adhd_index), and asserts the two outputs are bit-identical.
+    A model that is even accidentally phenotype-sensitive -- e.g. a
+    future refactor that wires pheno in under a different flag -- would
+    fail this immediately, rather than being caught only by a human
+    reading the class definition.
+
+    `model_name_or_spec` is either a MODEL_SPECS key or a raw
+    {model_cls, kwargs} dict (so this can also be pointed at ADHDNet
+    itself, as a negative control -- see Test M).
+    """
+    spec = MODEL_SPECS[model_name_or_spec] if isinstance(model_name_or_spec, str) else model_name_or_spec
+    model = spec['model_cls'](**spec['kwargs']).to(DEVICE)
+    model.eval()
+    torch.manual_seed(0)
+    vol = torch.randn(batch_size, *vol_shape, device=DEVICE)
+    pheno_a = torch.randn(batch_size, 5, device=DEVICE)
+    pheno_b = torch.randn(batch_size, 5, device=DEVICE) * 100.0 + 50.0  # wildly different values
+    with torch.no_grad():
+        out_a = model(vol, pheno_a)
+        out_b = model(vol, pheno_b)
+    identical = torch.equal(out_a, out_b)
+    return dict(
+        model_name=model_name_or_spec if isinstance(model_name_or_spec, str) else spec['model_cls'].__name__,
+        phenotype_blind=identical,
+        max_abs_diff=float((out_a - out_b).abs().max()),
+    )
 
 
 def _step_loss(model, spec, vol, pheno, label, criterion):
@@ -1025,7 +1231,7 @@ def run_sanity_check():
     with tempfile.TemporaryDirectory(prefix='exp_audit_embedtest_') as tmp:
         index_path, _ = _make_synthetic_dataset(tmp, n_subjects=12, sites=('SiteA', 'SiteB'))
         val_ds = ADHDDataset(index_path, augment=False)
-        model = ADHDProposedModelV2(trm_type='pairwise', use_attention=True)
+        model = ADHDProposedModelV2(trm_type='pairwise', use_attention=True).to(DEVICE)
         report, embeddings, subject_ids, labels, stability_df = representation_quality_report(
             model, val_ds, tag='synthetic')
         assert embeddings.shape == (12, 128)
@@ -1147,7 +1353,83 @@ def run_sanity_check():
             print(f"    {model_name:<20} params={result['params']:>7,}  auroc={result['auroc']:.4f}  status={status}")
     print("  TEST K PASSED")
 
-    print(f"\n{'=' * 70}\n  ALL SYNTHETIC SANITY CHECKS (A-K) PASSED ✓\n{'=' * 70}")
+    # ---- Test L: representation_collapse_diagnostics() on two engineered,
+    #      known-ground-truth scenarios -- proves it actually discriminates
+    #      "global alignment" from "genuine class-discrimination loss",
+    #      not just that it runs without error ----
+    print("\n  Test L -- collapse diagnostics distinguish global alignment from genuine collapse:")
+    rng = np.random.default_rng(7)
+    n_per_class = 40
+    dim = 128
+
+    # Scenario 1: GLOBAL ALIGNMENT. Two genuinely well-separated classes,
+    # then a single large shared offset vector added to EVERY embedding
+    # (simulating every representation being pulled toward a common
+    # direction/region). Raw cosine similarity should look "collapsed"
+    # (high between-class similarity, small raw gap) purely because of
+    # the shared offset -- but centering removes it, and centroid
+    # separation / the linear-projection AUC (both shift-invariant)
+    # should reveal the original separation was never actually destroyed.
+    mu0_true = rng.standard_normal(dim) * 0.3
+    mu1_true = mu0_true + rng.standard_normal(dim) * 2.0  # well-separated true means
+    class0 = mu0_true + rng.standard_normal((n_per_class, dim)) * 0.5
+    class1 = mu1_true + rng.standard_normal((n_per_class, dim)) * 0.5
+    shared_offset = rng.standard_normal(dim) * 20.0  # dominates raw cosine direction
+    aligned_embeddings = np.concatenate([class0, class1]) + shared_offset
+    aligned_labels = np.array([0] * n_per_class + [1] * n_per_class)
+
+    aligned_report = representation_collapse_diagnostics(aligned_embeddings, aligned_labels)
+    assert aligned_report['raw_pairwise']['between_class'] > 0.9, \
+        "scenario setup check: the shared offset should make raw cosine similarity look collapsed"
+    assert aligned_report['centered_pairwise']['gap'] > aligned_report['raw_pairwise']['gap'], \
+        "centering must recover MORE separation than the raw (offset-dominated) similarity shows"
+    assert aligned_report['linear_centroid_projection_auc'] > 0.95, \
+        "a shift-invariant linear readout must still cleanly separate the two (truly separated) classes"
+    print(f"    [global alignment] raw gap={aligned_report['raw_pairwise']['gap']:.4f}  "
+          f"centered gap={aligned_report['centered_pairwise']['gap']:.4f}  "
+          f"fisher_ratio={aligned_report['centroid_separation']['fisher_like_ratio']:.4f}  "
+          f"projection_auc={aligned_report['linear_centroid_projection_auc']:.4f}  "
+          f"(correctly identified as NOT genuinely collapsed)")
+
+    # Scenario 2: GENUINE COLLAPSE. Both "classes" are drawn from the
+    # IDENTICAL distribution (no real class signal at all) -- centering
+    # must NOT manufacture separation that was never there, and the
+    # linear-projection AUC must sit at chance.
+    shared_mu = rng.standard_normal(dim) * 0.3
+    collapsed_embeddings = shared_mu + rng.standard_normal((2 * n_per_class, dim)) * 0.5
+    collapsed_labels = np.array([0] * n_per_class + [1] * n_per_class)
+
+    collapsed_report = representation_collapse_diagnostics(collapsed_embeddings, collapsed_labels)
+    assert collapsed_report['centroid_separation']['fisher_like_ratio'] < 0.3, \
+        "genuinely identical-distribution classes must show a near-zero Fisher-like ratio"
+    assert 0.3 < collapsed_report['linear_centroid_projection_auc'] < 0.7, \
+        "genuinely identical-distribution classes must show a near-chance projection AUC"
+    print(f"    [genuine collapse] raw gap={collapsed_report['raw_pairwise']['gap']:.4f}  "
+          f"centered gap={collapsed_report['centered_pairwise']['gap']:.4f}  "
+          f"fisher_ratio={collapsed_report['centroid_separation']['fisher_like_ratio']:.4f}  "
+          f"projection_auc={collapsed_report['linear_centroid_projection_auc']:.4f}  "
+          f"(correctly identified as genuinely collapsed -- no class signal to recover)")
+    print("  TEST L PASSED")
+
+    # ---- Test M: item 3 -- EVERY MRI-only model spec is behaviorally phenotype-blind,
+    #      proven against a negative control (ADHDNet, which DOES use phenotype) ----
+    print("\n  Test M -- phenotype blindness, behavioral proof (item 3), all 7 specs + negative control:")
+    for model_name in MODEL_SPECS:
+        result = verify_phenotype_blindness(model_name)
+        assert result['phenotype_blind'] is True, \
+            f"{model_name} is supposed to be MRI-only but its output changed with the phenotype input!"
+        print(f"    {model_name:<20} phenotype_blind={result['phenotype_blind']}  "
+              f"max_abs_diff={result['max_abs_diff']:.2e}")
+    negative_control = verify_phenotype_blindness(dict(model_cls=ADHDNet, kwargs=dict(n_pheno=5, dropout=0.3)))
+    assert negative_control['phenotype_blind'] is False, \
+        "negative control FAILED: ADHDNet is supposed to BE phenotype-sensitive -- if this " \
+        "assertion fires, verify_phenotype_blindness() itself has a bug (it isn't actually " \
+        "testing anything, since even the known-multimodal model would pass)"
+    print(f"    {'ADHDNet (negative control)':<20} phenotype_blind={negative_control['phenotype_blind']}  "
+          f"max_abs_diff={negative_control['max_abs_diff']:.2e}  (correctly phenotype-SENSITIVE)")
+    print("  TEST M PASSED")
+
+    print(f"\n{'=' * 70}\n  ALL SYNTHETIC SANITY CHECKS (A-M) PASSED ✓\n{'=' * 70}")
     print("  (No real dataset was loaded, nothing under baseline/, phase2/, or "
           "phase2/consistency/ was read or written. Section 4's harness is now "
           "implemented and unit-tested, but has NOT been run on real data.)")

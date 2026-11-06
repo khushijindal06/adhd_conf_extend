@@ -18,11 +18,22 @@ implements every audit utility described below as executable code
 verification, log-consistency checking, calibration/ROC-PR/embedding
 diagnostics, and a repeated-CV + leave-one-site-out controlled-comparison
 harness covering all 7 models). It has been tested with synthetic data
-only (11 tests, A-K, all passing — see
+only (13 tests, A-M, all passing — see
 `experimental_audit_sanity_output.txt`) and has **not** been run against
 real data or real compute. See "Which analyses need existing checkpoints
 vs. new training" at the end of this report for exactly what each piece
 needs to produce real numbers.
+
+**Update 3:** the user ran this module's Test G against real data on
+Kaggle (GPU) and hit a device-mismatch runtime error — fixed below (§6).
+Fixing it required two new tests (Test L, Test M) that a prior,
+unverified version of the embedding-collapse check would have passed
+incorrectly; writing Test L's negative control caught a real
+methodological bug (naive in-sample centroid-projection AUC is
+overoptimistic in a ~128-dimension/~180-sample regime) and the fix is
+now in the diagnostic function itself, not just the test. See §6 for the
+full account and §7 for the resulting read of the user's real M0/M1
+representation numbers.
 
 Reported real-data results under audit:
 
@@ -287,6 +298,143 @@ figure from the real run — this is static code review of the package in
 against synthetic data in its own temp directories. No architecture or
 model-module changes were made or proposed. Phase 3 has not been started.
 
+## 6. Audit module bug fix (device handling)
+
+**The bug.** `code/experimental_audit.py`'s Test G built a fresh
+`ADHDProposedModelV2` for its synthetic embedding-extraction check
+without moving it to `DEVICE`:
+```python
+model = ADHDProposedModelV2(trm_type='pairwise', use_attention=True)   # stayed on CPU
+```
+while `extract_val_embeddings()`/`within_subject_stability()` move the
+MRI batch to `DEVICE` (`vol = vol.to(DEVICE)`) before calling
+`encode_representation()`. On this sandbox (CPU-only, `DEVICE == 'cpu'`)
+both land on the same device and the bug was invisible; on the user's
+real Kaggle GPU run (`DEVICE == 'cuda'`), `model` stayed on CPU while
+`vol` moved to CUDA, exactly as reported.
+
+**The fix, applied in two places (belt and suspenders), not one:**
+1. Test G itself now does `.to(DEVICE)` when building the model.
+2. `extract_val_embeddings()` and `within_subject_stability()` — the two
+   functions meant to be called directly against a real, freshly-loaded
+   checkpoint, not only through Test G — now call `model = model.to(
+   DEVICE)` defensively at their own entry point, so a future caller
+   that forgets to move the model can't reintroduce this bug. `.to()` on
+   a tensor/module already on the right device is a no-op, so this adds
+   no behavior change for a model that's already correctly placed.
+
+**Rerun of the complete synthetic suite, as required** ("do not claim
+completion if a test fails"): all tests now pass, **A through M** (two
+new tests were added alongside the fix — see §7 below for why). Full
+output: `experimental_audit_sanity_output.txt`. Also re-verified from a
+fresh, isolated extraction of the repo's `code/` directory (self-
+contained) and separately against the real notebook's own
+`_adhd200_combined_*` modules (not just the standalone package) — both
+pass identically. This sandbox has no GPU, so the exact CUDA/CPU
+mismatch Test G hit cannot be reproduced here; the fix is verified
+logically (device placement is now explicit and idempotent, not
+inferred from the environment) and should be re-confirmed on the user's
+own GPU Kaggle run.
+
+## 7. Representation diagnostics: reading the real M0/M1 numbers
+
+The user reported, from a real run of this module's embedding
+diagnostics against the actual `best_m0_model.pt`/`best_m1_model.pt`:
+
+| | M0 | M1 |
+|---|---|---|
+| Within-subject stability | 0.4263 | 0.9324 |
+| Between-class cosine similarity | 0.0017 | 0.7499 |
+| Class-separation gap | 0.2069 | 0.0706 |
+| (for reference) Classification AUROC | 0.7394 | 0.7552 |
+
+**One fact worth stating up front: M1's classification AUROC is not
+worse than M0's — it's slightly better** (0.7552 vs 0.7394). AUROC is
+threshold-independent; if the representation had genuinely lost
+class-discriminative information, AUROC would be expected to degrade
+toward 0.5 alongside the raw similarity numbers, not hold up or improve.
+That it didn't is itself evidence against "genuine class-discrimination
+loss" as the explanation for M1's lower sensitivity/F1 — those are both
+threshold-dependent (fixed 0.5 cutoff), so a drop there alongside a
+*held* or *improved* AUROC points toward a shifted decision boundary
+/ calibration effect, not a destroyed signal.
+
+**Reading the raw numbers**: M0's between-class similarity (0.0017)
+is close to zero — different-class embeddings are nearly orthogonal on
+average — and its within-class similarity is modest too (≈0.2086,
+i.e. gap + between ≈ 0.2069 + 0.0017), consistent with M0 producing
+relatively diffuse, loosely-clustered embeddings overall (which lines up
+with its own *low* within-subject stability of 0.4263 — M0's
+representations aren't very reproducible under small perturbations
+either). M1's between-class similarity (0.7499) is high — even
+different-class embeddings are now quite similar to each other — and
+its within-class similarity is higher still (≈0.8205). That pattern (both
+within- and between-class similarity rising together, while within-
+subject stability also rises) is exactly the signature of the two
+hypotheses the user asked to be distinguished:
+- **Genuine class-discrimination loss**: the consistency objective
+  destroyed the class-relevant signal in the representation.
+- **Global embedding alignment**: the consistency objective pulled every
+  representation (regardless of class) toward a more similar shared
+  region/direction of the embedding space — which mechanically raises
+  *both* within- and between-class raw cosine similarity together
+  (since raw cosine similarity is sensitive to any shared component
+  common to all vectors), without necessarily destroying the relative,
+  class-specific structure.
+
+**The five-part check now implemented to tell them apart**
+(`representation_collapse_diagnostics()`, wired automatically into
+`representation_quality_report()`'s output as `collapse_diagnostics`):
+centered pairwise similarity (removes any shared global direction before
+comparing), class-centroid Euclidean distance + cosine similarity +
+a scale/shift-invariant Fisher-like ratio, embedding norms per class
+(rules out "collapsed toward the origin" as a trivial alternative), and
+a **cross-validated** linear centroid-projection AUC (fits the
+discriminant axis on a train fold, scores a held-out fold — see §6 note
+below on why this has to be cross-validated). Verified in Test L against
+two engineered scenarios with known ground truth: a genuinely
+well-separated pair of classes with a large shared offset added to every
+embedding (simulating "global alignment") correctly shows a small raw
+gap but a large centered gap, a high Fisher ratio, and a cross-validated
+projection AUC of 1.0000; two classes drawn from the *identical*
+distribution (simulating "genuine collapse", no class signal at all)
+correctly shows both the raw and centered gap near zero, a low Fisher
+ratio, and a projection AUC near chance (0.5375 in the actual test run).
+
+**A methodological fix this uncovered, independent of the device bug**:
+the first version of the centroid-projection AUC fit the discriminant
+axis and scored it on the *same* samples (in-sample). Test L's negative
+control — two classes from the identical distribution, which must score
+near 0.5 — instead scored near 1.0, because with ~128 embedding
+dimensions and a finite sample, fitting and evaluating a centroid
+discriminant on the same data is optimistically biased (the axis is
+chosen, using the data, to maximize exactly the split being measured).
+This is precisely the regime the real checkpoints run in (~180 real
+validation subjects, 128-d embeddings), so an in-sample version of this
+check could have overstated how much discriminative signal survived in
+M1. The fix — stratified k-fold, fit on train, score on held-out, pooled
+— is in `_cv_centroid_projection_auc()` and is what `representation_
+collapse_diagnostics()` now actually calls.
+
+**What this means for M0 vs M1, honestly**: the hypothesis that M1's
+pattern (rising within- *and* between-class similarity together, rising
+stability, held/improved AUROC) reflects global alignment rather than
+genuine collapse is well-supported by the circumstantial evidence above
+(held AUROC; within- and between-class similarity moving together rather
+than between-class alone cannibalizing within-class). **This report does
+not yet have the definitive answer** — that requires running the now-
+fixed `representation_quality_report()` (or `representation_collapse_
+diagnostics()` directly on the real M0/M1 embeddings) against the actual
+checkpoints, which needs the embedding-extraction cell re-run with the
+corrected module. The centered gap, Fisher ratio, and especially the
+cross-validated projection AUC on the *real* embeddings will say
+definitively whether M1's class information survived (projection AUC
+well above 0.5, comparable to its own 0.7552 classification AUROC) or
+was genuinely lost (projection AUC near 0.5 despite the held
+classification AUROC — which would itself be a surprising, separately
+interesting finding worth its own follow-up). **Pending**: rerun against
+real data with the corrected module.
+
 ## Which analyses need existing checkpoints vs. new training
 
 Per-function breakdown of `code/experimental_audit.py` (all 11 synthetic
@@ -303,7 +451,8 @@ no training:**
 | `check_log_header_result_alignment()` | the raw console log text (already resolved the real A3/A4 case by hand in §2; this makes it a reusable, automatic check for next time) |
 | `roc_pr_comparison()`, `probability_distributions()`, `per_class_metrics()` | existing `val_predictions_{m0,m1}.csv` |
 | `calibration_metrics()` + `plot_reliability_diagram()` | existing `val_predictions_{m0,m1}.csv` |
-| `extract_val_embeddings()`, `within_subject_stability()`, `between_subject_similarity()`, `representation_quality_report()` | existing `best_m0_model.pt`/`best_m1_model.pt` + the saved train/val subject-ID split — one frozen forward pass per subject, no gradient, no architecture change (this is the "implement that functionality so it can run on existing checkpoints without retraining" ask, directly) |
+| `extract_val_embeddings()`, `within_subject_stability()`, `between_subject_similarity()`, `representation_collapse_diagnostics()`, `representation_quality_report()` | existing `best_m0_model.pt`/`best_m1_model.pt` + the saved train/val subject-ID split — one frozen forward pass per subject, no gradient, no architecture change (this is the "implement that functionality so it can run on existing checkpoints without retraining" ask, directly) |
+| `verify_phenotype_blindness()` | a freshly-constructed (untrained) instance of any `MODEL_SPECS` entry — proves MRI-only status behaviorally, needs no checkpoint at all |
 
 **Requires NEW training — not run by this module on its own:**
 

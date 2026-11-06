@@ -36,7 +36,7 @@ Device : cpu
   Test H -- fold trainer: fresh run, skip-if-complete, fingerprint guards:
     Fresh run: status=fresh  Rerun (identical config): status=skipped
     Changed index_hash correctly REFUSED: [testfold] REFUSING to reuse a fold result -- configuration has changed since it was produced:
-    Missing config_fingerprint correctly REFUSED: [testfold] REFUSING to reuse -- /tmp/exp_audit_foldout_tzmhot8n/testfold_config.json has no config_fingerprint (predates this safeguard, or was produced by a different module version), so there is no way to verify it matches the current configuration. Point OUT_DIR at a fresh, empty directory.
+    Missing config_fingerprint correctly REFUSED: [testfold] REFUSING to reuse -- /tmp/exp_audit_foldout_g72ex8t7/testfold_config.json has no config_fingerprint (predates this safeguard, or was produced by a different module version), so there is no way to verify it matches the current configuration. Point OUT_DIR at a fresh, empty directory.
   TEST H PASSED
 
   Test I -- repeated-CV fold count + LOSO single-class-site exclusion:
@@ -61,7 +61,23 @@ model_name     mean      std  count
     M1                   params=114,482  auroc=0.7500  status=fresh
   TEST K PASSED
 
+  Test L -- collapse diagnostics distinguish global alignment from genuine collapse:
+    [global alignment] raw gap=0.0040  centered gap=1.5873  fisher_ratio=3.9529  projection_auc=1.0000  (correctly identified as NOT genuinely collapsed)
+    [genuine collapse] raw gap=0.0030  centered gap=0.0038  fisher_ratio=0.2440  projection_auc=0.5375  (correctly identified as genuinely collapsed -- no class signal to recover)
+  TEST L PASSED
+
+  Test M -- phenotype blindness, behavioral proof (item 3), all 7 specs + negative control:
+    baseline_mri_only    phenotype_blind=True  max_abs_diff=0.00e+00
+    A3                   phenotype_blind=True  max_abs_diff=0.00e+00
+    A4                   phenotype_blind=True  max_abs_diff=0.00e+00
+    A4-new               phenotype_blind=True  max_abs_diff=0.00e+00
+    A5-new               phenotype_blind=True  max_abs_diff=0.00e+00
+    M0                   phenotype_blind=True  max_abs_diff=0.00e+00
+    M1                   phenotype_blind=True  max_abs_diff=0.00e+00
+    ADHDNet (negative control) phenotype_blind=False  max_abs_diff=3.13e+00  (correctly phenotype-SENSITIVE)
+  TEST M PASSED
+
 ======================================================================
-  ALL SYNTHETIC SANITY CHECKS (A-K) PASSED ✓
+  ALL SYNTHETIC SANITY CHECKS (A-M) PASSED ✓
 ======================================================================
   (No real dataset was loaded, nothing under baseline/, phase2/, or phase2/consistency/ was read or written. Section 4's harness is now implemented and unit-tested, but has NOT been run on real data.)
