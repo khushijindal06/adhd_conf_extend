@@ -10,6 +10,14 @@ real-data audit, and post-hoc analysis scripts.
   `code/experimental_audit.py` below). Several items are marked
   **PENDING** real-run artifacts — see "Outstanding items" and "Which
   analyses need existing checkpoints vs. new training" at the end.
+- [`ARCHITECTURE_AUDIT_REPORT.md`](ARCHITECTURE_AUDIT_REPORT.md) — the
+  8-phase pipeline/architecture/reliability audit: preprocessing
+  consistency, resolution, the fair MRI-only baseline, encoder/token/TRM/
+  attention diagnostics, the M0/M1 consistency-loss investigation,
+  augmentation, repeated-CV/LOSO reporting, and implementation
+  reliability (including two real bugs found and fixed — see
+  `code/experimental_audit.py` below). Deliverable 5 (final
+  recommendation) is explicitly deferred pending real-data results.
 - [`code/`](code) — Phase 1 (baseline `ADHDNet` + ablations) and Phase 2,
   Steps 1–2 (pairwise Token Relationship Module, representation-consistency
   learning). See `code/README.md` for setup and run instructions.
@@ -37,10 +45,28 @@ real-data audit, and post-hoc analysis scripts.
     comparison harness covering all 7 models (`baseline_mri_only`, A3,
     A4, A4-new, A5-new, M0, M1). Imports the existing model classes and
     training utilities unmodified; defines no new model. `python
-    experimental_audit.py` runs its synthetic-only sanity suite (11
-    tests, A-K — see
+    experimental_audit.py` runs its synthetic-only sanity suite (17
+    tests, A-Q — see
     [`experimental_audit_sanity_output.txt`](experimental_audit_sanity_output.txt)).
     Has not been run against real data.
+  - [`code/architecture_audit.py`](code/architecture_audit.py) — encoder/
+    token/TRM/attention diagnostics (Phase 3), a separate scale-preserving
+    attention ablation class, a consistency-loss lambda sweep + warmup
+    schedule (Phase 4), and an MRI-safe augmentation ablation (Phase 5).
+    Imports the existing model classes unmodified; defines exactly one new
+    class (`ScalePreservingAnatomicalAttention`), alongside, not instead
+    of, the existing `AnatomicalAttention`. `python architecture_audit.py`
+    runs its synthetic-only sanity suite (6 tests, A-F — see
+    [`architecture_audit_sanity_output.txt`](architecture_audit_sanity_output.txt)).
+  - [`code/preprocessing_audit.py`](code/preprocessing_audit.py) —
+    NIfTI affine/voxel-spacing consistency checker, per-subject
+    preprocessing-variant classification, site/class/QC/missing-scan
+    reporting, representative-slice visualization, and a 64³-vs-96³
+    resolution-comparison harness with gradient accumulation (Phase 1).
+    Read-only against existing outputs except the (not-yet-run)
+    resolution harness. `python preprocessing_audit.py` runs its
+    synthetic-only sanity suite (5 tests, A-E — nibabel-written fake
+    NIfTI files, no real MRI data).
 - [`analysis/`](analysis) — read-only / inference-only scripts used by the
   audit:
   - `check_phenotype_leakage.py` — univariate AUROC + distribution checks

@@ -849,6 +849,8 @@ def train_one_fold(model_name, fold_tag, train_ds, val_ds, out_dir, index_hash, 
     spec = MODEL_SPECS[model_name]
     paths = dict(
         latest=f'{out_dir}/{fold_tag}_latest_checkpoint.pt',
+        best_model=f'{out_dir}/{fold_tag}_best_model.pt',
+        best_preds=f'{out_dir}/{fold_tag}_best_preds.csv',
         results=f'{out_dir}/{fold_tag}_results.csv',
         config=f'{out_dir}/{fold_tag}_config.json',
         oof=f'{out_dir}/{fold_tag}_oof_predictions.csv',
@@ -894,6 +896,16 @@ def train_one_fold(model_name, fold_tag, train_ds, val_ds, out_dir, index_hash, 
         start_epoch = ckpt['epoch'] + 1
         best = ckpt['best']
         patience_ctr = ckpt['patience_ctr']
+        # Phase 7, item 4/8: the best EPOCH's predictions must survive a resume even if no
+        # epoch in THIS session beats it (best_probs/best_labels below are otherwise only
+        # ever set inside the `if auroc > best['auroc']` branch of the loop below -- on a
+        # resumed run whose remaining epochs never improve on the already-loaded best, that
+        # branch never fires again, and best_probs/best_labels would stay None all the way
+        # to the final OOF write, crashing there). Reload them from the sidecar written
+        # alongside whichever checkpoint actually produced the CURRENT best['epoch'].
+        if os.path.isfile(paths['best_preds']):
+            best_preds_df = pd.read_csv(paths['best_preds'])
+            best_probs, best_labels = best_preds_df['y_prob'].tolist(), best_preds_df['y_true'].tolist()
         print(f"  [{fold_tag}] RESUMING from epoch {ckpt['epoch']}")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -925,6 +937,15 @@ def train_one_fold(model_name, fold_tag, train_ds, val_ds, out_dir, index_hash, 
             best = dict(auroc=auroc, epoch=epoch)
             best_probs, best_labels = list(probs), list(labels_list)
             patience_ctr = 0
+            # Phase 7, item 3: best-model checkpoint saved SEPARATELY from the latest
+            # (per-epoch, always-overwritten) checkpoint below -- matching the existing
+            # convention in phase2_trm_ablation.py/phase2_consistency.py, which this
+            # harness's earlier version did not (it only ever wrote `latest`, with no
+            # standalone best-weights file). The sidecar prediction CSV lets a later
+            # resume recover best_probs/best_labels without reloading/re-evaluating the
+            # full model (see the RESUMING branch above).
+            atomic_save({k: v.clone() for k, v in model.state_dict().items()}, paths['best_model'])
+            atomic_to_csv(pd.DataFrame(dict(y_true=best_labels, y_prob=best_probs)), paths['best_preds'])
         else:
             patience_ctr += 1
 
@@ -940,12 +961,44 @@ def train_one_fold(model_name, fold_tag, train_ds, val_ds, out_dir, index_hash, 
             break
 
     val_ids = val_ds.df['subject_id'].tolist()
+    if best_probs is None or best_labels is None:
+        raise RuntimeError(
+            f"[{fold_tag}] best_probs/best_labels are still unset after training -- this means "
+            f"no epoch ever improved on the initial -1.0 AUROC sentinel, which should be "
+            f"impossible for epochs >= 1 (see item 2: 'first-valid-checkpoint' sentinel fix "
+            f"elsewhere in this package), or {paths['best_preds']} was missing on a resume with "
+            f"zero remaining epochs. Investigate before trusting this fold's OOF predictions.")
+    # THRESHOLD_SELECTION_POLICY (Phase 6): the decision threshold is the fixed constant
+    # 0.5 below, applied identically to every fold of every model -- never fit, searched,
+    # or adjusted using this (or any) held-out fold's own labels. The only thing chosen
+    # using fold data is which EPOCH's checkpoint is "best" (by validation AUROC, which
+    # is threshold-independent); the 0.5 cutoff itself is never tuned.
+    best_preds = (np.array(best_probs) >= 0.5).astype(int)
     oof_df = pd.DataFrame(dict(subject_id=val_ids, y_true=best_labels, y_prob=best_probs,
-                                y_pred=(np.array(best_probs) >= 0.5).astype(int)))
+                                y_pred=best_preds))
     atomic_to_csv(oof_df, paths['oof'])
 
-    result = dict(model_name=model_name, fold_tag=fold_tag, auroc=best['auroc'], best_epoch=best['epoch'],
-                   n_val=len(val_ids), params=sum(p.numel() for p in model.parameters()))
+    cm = confusion_matrix(best_labels, best_preds, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) else None
+    specificity = tn / (tn + fp) if (tn + fp) else None
+    precision = tp / (tp + fp) if (tp + fp) else None
+    f1 = (2 * precision * sensitivity / (precision + sensitivity)
+          if precision and sensitivity and (precision + sensitivity) else None)
+    try:
+        auprc = float(average_precision_score(best_labels, best_probs))
+    except Exception:
+        auprc = None
+    accuracy = float(np.mean(np.array(best_labels) == best_preds))
+    balanced_accuracy = (float((sensitivity + specificity) / 2)
+                         if sensitivity is not None and specificity is not None else None)
+
+    result = dict(model_name=model_name, fold_tag=fold_tag, auroc=best['auroc'], auprc=auprc,
+                   accuracy=accuracy, balanced_accuracy=balanced_accuracy,
+                   sensitivity=sensitivity, specificity=specificity, f1=f1,
+                   tn=int(tn), fp=int(fp), fn=int(fn), tp=int(tp),
+                   best_epoch=best['epoch'], n_val=len(val_ids),
+                   params=sum(p.numel() for p in model.parameters()))
     atomic_to_csv(pd.DataFrame([result]), paths['results'])
     with open(paths['config'], 'w') as f:
         json.dump(dict(model_name=model_name, fold_tag=fold_tag, config_fingerprint=current_fp), f, indent=2)
@@ -953,15 +1006,46 @@ def train_one_fold(model_name, fold_tag, train_ds, val_ds, out_dir, index_hash, 
     return result, 'fresh'
 
 
-def build_repeated_cv_folds(raw_df, n_splits=5, n_repeats=2, seed=SEED):
-    """Item 4: stratified REPEATED k-fold over subject-level labels."""
-    rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
+def build_repeated_cv_folds(raw_df, n_splits=5, n_repeats=2, seed=SEED, stratify_by_site=False,
+                             min_per_combined_bin=2):
+    """
+    Item 4 / Phase 6: stratified REPEATED k-fold over subject-level
+    labels. `stratify_by_site=True` stratifies by (label, site) jointly
+    where every combined bin has at least `min_per_combined_bin`
+    subjects (so every fold gets a representative mix of sites, not
+    just diagnoses) -- falls back to label-only stratification (the
+    default) for any site whose per-label counts are too small for
+    joint stratification to be meaningful, logging which sites fell
+    back rather than silently using one scheme for some subjects and
+    another for others.
+    """
     subject_ids = raw_df['subject_id'].values
     labels = raw_df['label'].values
+    fallback_sites = []
+    if stratify_by_site and 'site' in raw_df.columns:
+        combined = raw_df['site'].astype(str) + '_' + raw_df['label'].astype(str)
+        bin_counts = combined.value_counts()
+        eligible_sites = set(raw_df['site'].unique())
+        for site in raw_df['site'].unique():
+            for label in (0, 1):
+                key = f'{site}_{label}'
+                if bin_counts.get(key, 0) < min_per_combined_bin:
+                    eligible_sites.discard(site)
+        fallback_sites = sorted(set(raw_df['site'].unique()) - eligible_sites)
+        strat_labels = np.where(raw_df['site'].isin(eligible_sites), combined, raw_df['label'].astype(str)).astype(str)
+    else:
+        strat_labels = labels
+
+    rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
     folds = []
-    for i, (train_idx, val_idx) in enumerate(rskf.split(np.zeros(len(labels)), labels)):
-        folds.append(dict(fold_id=f'cv{i:02d}', train_ids=subject_ids[train_idx].tolist(),
+    for i, (train_idx, val_idx) in enumerate(rskf.split(np.zeros(len(labels)), strat_labels)):
+        folds.append(dict(fold_id=f'cv{i:02d}', fold_type='cv',
+                           train_ids=subject_ids[train_idx].tolist(),
                            val_ids=subject_ids[val_idx].tolist()))
+    if stratify_by_site:
+        for f in folds:
+            f['stratified_by_site'] = True
+            f['sites_fallen_back_to_label_only'] = fallback_sites
     return folds
 
 
@@ -982,8 +1066,71 @@ def build_loso_folds(raw_df, min_per_class=5):
             continue
         val_ids = site_df['subject_id'].tolist()
         train_ids = raw_df[raw_df['site'] != site]['subject_id'].tolist()
-        folds.append(dict(fold_id=f'loso_{site}', train_ids=train_ids, val_ids=val_ids))
+        folds.append(dict(fold_id=f'loso_{site}', fold_type='loso', train_ids=train_ids, val_ids=val_ids))
     return folds, skipped
+
+
+def fold_distribution_report(fold, raw_df, id_col='subject_id', label_col='label', site_col='site'):
+    """
+    Phase 6: "Report the class distribution and site distribution for
+    every fold." Returns train/val class counts and, if `site_col` is
+    present, train/val site counts, for one fold dict (as produced by
+    build_repeated_cv_folds()/build_loso_folds()). Also re-confirms no
+    subject appears in both train and val (belt and suspenders on top
+    of the fold builders' own construction).
+    """
+    train_df = raw_df[raw_df[id_col].isin(fold['train_ids'])]
+    val_df = raw_df[raw_df[id_col].isin(fold['val_ids'])]
+    overlap = set(fold['train_ids']) & set(fold['val_ids'])
+    report = dict(
+        fold_id=fold['fold_id'], fold_type=fold.get('fold_type', 'unknown'),
+        n_train=len(train_df), n_val=len(val_df), subject_overlap=sorted(overlap),
+        train_class_counts=train_df[label_col].value_counts().to_dict(),
+        val_class_counts=val_df[label_col].value_counts().to_dict(),
+    )
+    if site_col in raw_df.columns:
+        report['train_site_counts'] = train_df[site_col].value_counts().to_dict()
+        report['val_site_counts'] = val_df[site_col].value_counts().to_dict()
+    return report
+
+
+def aggregate_fold_metrics(results_df, metrics=('auroc', 'auprc', 'accuracy', 'balanced_accuracy',
+                                                 'sensitivity', 'specificity', 'f1'),
+                            confidence=0.95):
+    """
+    Phase 6: mean/std/count + a normal-approximation confidence interval
+    across folds, per model, computed SEPARATELY for repeated-CV and
+    LOSO rows -- "Keep repeated-CV and LOSO results separate in all
+    tables" -- never pooled into one number. Requires a `fold_type`
+    column (both fold builders above tag it); raises rather than
+    silently mixing if it's missing.
+    """
+    if 'fold_type' not in results_df.columns:
+        raise ValueError("results_df has no 'fold_type' column -- cannot keep repeated-CV and "
+                          "LOSO results separate without it.")
+    from scipy import stats as _stats
+    rows = []
+    for fold_type, group in results_df.groupby('fold_type'):
+        for model_name, model_group in group.groupby('model_name'):
+            row = dict(fold_type=fold_type, model_name=model_name, n_folds=len(model_group))
+            for m in metrics:
+                if m not in model_group.columns:
+                    continue
+                vals = model_group[m].dropna().astype(float)
+                if len(vals) == 0:
+                    row[f'{m}_mean'] = row[f'{m}_std'] = row[f'{m}_ci_low'] = row[f'{m}_ci_high'] = None
+                    continue
+                mean, std, n = vals.mean(), vals.std(ddof=1) if len(vals) > 1 else 0.0, len(vals)
+                if n > 1 and std > 0:
+                    half_width = _stats.t.ppf((1 + confidence) / 2, n - 1) * std / np.sqrt(n)
+                else:
+                    half_width = 0.0
+                row[f'{m}_mean'] = float(mean)
+                row[f'{m}_std'] = float(std)
+                row[f'{m}_ci_low'] = float(mean - half_width)
+                row[f'{m}_ci_high'] = float(mean + half_width)
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def run_controlled_comparison(index_file, out_dir, model_names=None, n_splits=5, n_repeats=2,
@@ -1020,6 +1167,14 @@ def run_controlled_comparison(index_file, out_dir, model_names=None, n_splits=5,
           f"({len(skipped_sites)} sites skipped for too few of one class: "
           f"{[s['site'] for s in skipped_sites]})")
 
+    # Phase 6: class/site distribution for every fold, saved once (identical across
+    # model_names, since every model trains on the SAME folds) -- not per model.
+    distribution_rows = [fold_distribution_report(fold, raw_df) for fold in all_folds]
+    atomic_to_csv(pd.DataFrame(distribution_rows), f'{out_dir}/fold_distributions.csv')
+    for rep in distribution_rows:
+        assert not rep['subject_overlap'], \
+            f"fold {rep['fold_id']} has train/val subject overlap: {rep['subject_overlap']}"
+
     all_results = []
     for model_name in model_names:
         model_dir = f'{out_dir}/{model_name}'
@@ -1039,11 +1194,13 @@ def run_controlled_comparison(index_file, out_dir, model_names=None, n_splits=5,
             result = dict(result)
             result['model_name'] = model_name
             result['status'] = status
+            result['fold_type'] = fold['fold_type']
             all_results.append(result)
 
     results_df = pd.DataFrame(all_results)
     atomic_to_csv(results_df, f'{out_dir}/controlled_comparison_all_folds.csv')
-    summary_df = results_df.groupby('model_name')['auroc'].agg(['mean', 'std', 'count']).reset_index()
+    # Phase 6: repeated-CV and LOSO are aggregated separately, never pooled into one row.
+    summary_df = aggregate_fold_metrics(results_df)
     atomic_to_csv(summary_df, f'{out_dir}/controlled_comparison_summary.csv')
     return results_df, summary_df, skipped_sites
 
@@ -1429,7 +1586,116 @@ def run_sanity_check():
           f"max_abs_diff={negative_control['max_abs_diff']:.2e}  (correctly phenotype-SENSITIVE)")
     print("  TEST M PASSED")
 
-    print(f"\n{'=' * 70}\n  ALL SYNTHETIC SANITY CHECKS (A-M) PASSED ✓\n{'=' * 70}")
+    # ---- Test N: Phase 6 -- per-fold class/site distribution report + no-overlap check ----
+    print("\n  Test N -- fold distribution report (class + site counts, no train/val overlap):")
+    with tempfile.TemporaryDirectory(prefix='exp_audit_folddist_') as tmp:
+        index_path, df = _make_synthetic_dataset(tmp, n_subjects=20, sites=('SiteA', 'SiteB', 'SiteOneClass'))
+        cv_folds = build_repeated_cv_folds(df, n_splits=3, n_repeats=1)
+        for fold in cv_folds:
+            assert fold['fold_type'] == 'cv'
+        loso_folds, _ = build_loso_folds(df, min_per_class=2)
+        for fold in loso_folds:
+            assert fold['fold_type'] == 'loso'
+        report = fold_distribution_report(cv_folds[0], df)
+        assert report['subject_overlap'] == []
+        assert report['n_train'] + report['n_val'] == len(df)
+        assert 'train_site_counts' in report and 'val_site_counts' in report
+        print(f"    fold {report['fold_id']} ({report['fold_type']}): n_train={report['n_train']}  "
+              f"n_val={report['n_val']}  subject_overlap={report['subject_overlap']}  "
+              f"val_class_counts={report['val_class_counts']}")
+    print("  TEST N PASSED")
+
+    # ---- Test O: Phase 6 -- metric aggregation keeps CV and LOSO separate, with CIs ----
+    print("\n  Test O -- aggregate_fold_metrics() keeps repeated-CV and LOSO separate:")
+    synthetic_results = pd.DataFrame([
+        dict(model_name='A3', fold_type='cv', auroc=0.70, auprc=0.6, accuracy=0.65,
+             balanced_accuracy=0.65, sensitivity=0.6, specificity=0.7, f1=0.6),
+        dict(model_name='A3', fold_type='cv', auroc=0.72, auprc=0.62, accuracy=0.66,
+             balanced_accuracy=0.66, sensitivity=0.62, specificity=0.7, f1=0.61),
+        dict(model_name='A3', fold_type='loso', auroc=0.55, auprc=0.5, accuracy=0.5,
+             balanced_accuracy=0.5, sensitivity=0.5, specificity=0.5, f1=0.5),
+    ])
+    agg = aggregate_fold_metrics(synthetic_results)
+    assert set(agg['fold_type']) == {'cv', 'loso'}
+    cv_row = agg[(agg['fold_type'] == 'cv') & (agg['model_name'] == 'A3')].iloc[0]
+    loso_row = agg[(agg['fold_type'] == 'loso') & (agg['model_name'] == 'A3')].iloc[0]
+    assert cv_row['n_folds'] == 2 and loso_row['n_folds'] == 1
+    assert abs(cv_row['auroc_mean'] - 0.71) < 1e-6
+    assert cv_row['auroc_ci_low'] <= cv_row['auroc_mean'] <= cv_row['auroc_ci_high']
+    no_fold_type_col = synthetic_results.drop(columns=['fold_type'])
+    raised = False
+    try:
+        aggregate_fold_metrics(no_fold_type_col)
+    except ValueError:
+        raised = True
+    assert raised, "aggregate_fold_metrics() must refuse to run without a fold_type column"
+    print(f"    cv: n_folds={cv_row['n_folds']}  auroc_mean={cv_row['auroc_mean']:.4f}  "
+          f"95% CI=[{cv_row['auroc_ci_low']:.4f}, {cv_row['auroc_ci_high']:.4f}]  |  "
+          f"loso: n_folds={loso_row['n_folds']}  auroc_mean={loso_row['auroc_mean']:.4f}  "
+          f"(kept in separate rows, never pooled)")
+    print("  TEST O PASSED")
+
+    # ---- Test P: site-stratified repeated CV correctly falls back for too-small sites ----
+    print("\n  Test P -- site-stratified CV falls back to label-only for too-small sites:")
+    with tempfile.TemporaryDirectory(prefix='exp_audit_sitestrat_') as tmp:
+        index_path, df = _make_synthetic_dataset(tmp, n_subjects=24, sites=('SiteA', 'SiteB', 'SiteOneClass'))
+        folds = build_repeated_cv_folds(df, n_splits=2, n_repeats=1, stratify_by_site=True, min_per_combined_bin=2)
+        assert all(f.get('stratified_by_site') for f in folds)
+        assert 'SiteOneClass' in folds[0]['sites_fallen_back_to_label_only'], \
+            "SiteOneClass (single-class) must fall back to label-only stratification, not join-stratify"
+        print(f"    sites fallen back to label-only: {folds[0]['sites_fallen_back_to_label_only']} "
+              f"(SiteOneClass correctly flagged)")
+    print("  TEST P PASSED")
+
+    # ---- Test Q: Phase 7, item 4/8 -- best predictions survive a resume whose remaining
+    #      epochs never beat the already-loaded best (the exact bug this module had: before
+    #      the fix, best_probs/best_labels were only ever set in-memory inside the `if auroc
+    #      > best['auroc']` branch, so a resumed run that never re-triggers it crashed trying
+    #      to np.array(None) at the final OOF write) ----
+    print("\n  Test Q -- best predictions survive a resume that never re-beats the loaded best:")
+    with tempfile.TemporaryDirectory(prefix='exp_audit_resumebest_') as tmp_data, \
+         tempfile.TemporaryDirectory(prefix='exp_audit_resumebest_out_') as tmp_out:
+        index_path, df = _make_synthetic_dataset(tmp_data, n_subjects=16, sites=('SiteA', 'SiteB'))
+        train_ids = df['subject_id'].tolist()[:12]
+        val_ids = df['subject_id'].tolist()[12:]
+        fit_stats = ADHDDataset(index_path, subject_ids=train_ids, augment=False).get_fit_stats()
+        train_ds = ADHDDataset(index_path, subject_ids=train_ids, augment=False, fit_stats=fit_stats)
+        val_ds = ADHDDataset(index_path, subject_ids=val_ids, augment=False, fit_stats=fit_stats)
+        index_hash, split_hash = hash_file(index_path), hash_split(train_ids, val_ids)
+
+        global roc_auc_score
+        original_roc_auc_score = roc_auc_score
+        call_count = {'n': 0}
+
+        def _epoch1_best_then_worse(y_true, y_score):
+            call_count['n'] += 1
+            return 0.99 if call_count['n'] == 1 else 0.10   # epoch 1 wins; every later epoch loses
+
+        roc_auc_score = _epoch1_best_then_worse
+        try:
+            _, status1 = train_one_fold('A3', 'resumefold', train_ds, val_ds, tmp_out,
+                                         index_hash, split_hash, epochs=4, patience=100,
+                                         _stop_after_epoch=1)
+            assert status1 == 'interrupted'
+            best_preds_at_epoch1 = pd.read_csv(f'{tmp_out}/resumefold_best_preds.csv')
+
+            result2, status2 = train_one_fold('A3', 'resumefold', train_ds, val_ds, tmp_out,
+                                                index_hash, split_hash, epochs=4, patience=100)
+            assert status2 == 'fresh', "epochs 2-4 should still run (not skipped) to prove they genuinely didn't beat epoch 1"
+            assert result2['best_epoch'] == 1, \
+                f"epoch 1 (AUROC 0.99) should remain best through epochs 2-4 (AUROC 0.10 each), got best_epoch={result2['best_epoch']}"
+            oof = pd.read_csv(f'{tmp_out}/resumefold_oof_predictions.csv')
+            assert np.allclose(oof['y_prob'].values, best_preds_at_epoch1['y_prob'].values), \
+                "final OOF predictions must match epoch 1's (the true best), not a later, worse epoch's"
+        finally:
+            roc_auc_score = original_roc_auc_score
+        print(f"    interrupted after epoch 1 (forced AUROC=0.99) -> resumed through epochs 2-4 "
+              f"(forced AUROC=0.10 each, never beating epoch 1): status={status2}, "
+              f"best_epoch={result2['best_epoch']} (correct), final OOF matches epoch 1's predictions "
+              f"(correct) -- no crash, no silently-wrong 'last epoch' predictions.")
+    print("  TEST Q PASSED")
+
+    print(f"\n{'=' * 70}\n  ALL SYNTHETIC SANITY CHECKS (A-Q) PASSED ✓\n{'=' * 70}")
     print("  (No real dataset was loaded, nothing under baseline/, phase2/, or "
           "phase2/consistency/ was read or written. Section 4's harness is now "
           "implemented and unit-tested, but has NOT been run on real data.)")

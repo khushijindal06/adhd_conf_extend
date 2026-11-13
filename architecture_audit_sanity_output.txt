@@ -1,0 +1,185 @@
+=== preprocessing_audit.py ===
+======================================================================
+  PREPROCESSING AUDIT MODULE -- SYNTHETIC SANITY CHECKS
+======================================================================
+
+  Test A -- NIfTI header inspection against known ground truth:
+    shape=(80, 90, 100)  voxel_spacing_mm=(2.0, 2.0, 2.0)  orientation=RAS  (matches known ground truth)
+  TEST A PASSED
+
+  Test B -- affine consistency check correctly flags mixed voxel spacing:
+    4 identical-spacing files: already_on_common_grid=True  5 files (1 different spacing): already_on_common_grid=False, n_spacing_mismatch=1
+  TEST B PASSED
+
+  Test C -- scan-pattern tier classification against known filenames:
+    tier-0 (preferred), tier-4 (least-preferred fallback), and unmatched filenames all classified correctly
+  TEST C PASSED
+
+  Test D -- end-to-end against a synthetic processed_index.csv:
+    preprocessing_variant_distribution: {'tier_0': 12, 'tier_4': 6}  flag_nonuniform=True
+    audit_affine_consistency: n_spacing_mismatch=12/18  already_on_common_grid=False
+    site_class_report:
+label  control  adhd
+site                
+SiteA        0     9
+SiteB        9     0
+    qc_statistics: {'pass': 14, 'nan': 4}  n_missing=4
+    missing_mri_report: total=1  by_reason={'no_structural_scan': 1}
+    save_representative_slices: wrote 2 figures
+  TEST D PASSED
+
+  Test E -- resolution cost estimate + gradient-accumulation training step:
+    64^3 -> 96^3: voxel_count_ratio=3.375  linear_dimension_ratio=1.500
+    one epoch (batch_size=2, accumulation_steps=4 -> effective batch 8): loss=0.6982  parameters updated=True
+  TEST E PASSED
+
+======================================================================
+  ALL SYNTHETIC SANITY CHECKS (A-E) PASSED ✓
+======================================================================
+  (No real MRI data was used. nibabel-written synthetic NIfTI files and random .npy volumes only. Nothing under baseline/, phase2/, or phase2/consistency/ was read or written.)
+exit: 0
+=== architecture_audit.py ===
+Device : cpu
+======================================================================
+  ARCHITECTURE AUDIT MODULE -- SYNTHETIC SANITY CHECKS
+======================================================================
+
+  Test A -- feature-map + token diagnostics (inference-only):
+    feature_map_shape=(96, 8, 8, 8)  mean_frac_dead_channels=0.3377
+    n_tokens=16  effective_rank=4.75/512  mean_off_diag_cosine=1.0000
+    cross_class_token_diversity: within=1.0000  between=1.0000
+  TEST A PASSED
+
+  Test B -- relationship-matrix uniformity, known uniform vs known peaked:
+    uniform matrix: normalized_uniformity=1.0000 (expect ~1.0)  peaked matrix: normalized_uniformity=0.0519 (expect close to 0.0)
+    untrained pairwise TRM's own relationship matrix: normalized_uniformity=1.0000
+  TEST B PASSED
+
+  Test C -- scale-preserving attention vs existing AnatomicalAttention, forced near-uniform:
+    existing AnatomicalAttention:         mean_weight=0.0625  norm_ratio_after/before=0.0625 (collapses toward ~1/16)
+    ScalePreservingAnatomicalAttention:    mean_weight=0.0625  norm_ratio_after/before=1.0000 (preserved, ~1.0)
+  TEST C PASSED
+
+  Test D -- lambda warmup schedule, known ground truth:
+    epoch 1/5 -> 0.01, epoch 5/5 -> 0.05, epoch 10/5 -> 0.05 (held), warmup=0 -> 0.05 (unchanged) -- all correct
+  TEST D PASSED
+
+  Test E -- lambda sweep, tiny synthetic data, 1 epoch, 3 lambda values:
+      lam  auroc  sensitivity  specificity  balanced_accuracy
+0.000   0.75          0.0          1.0                0.5
+0.025   0.00          0.0          1.0                0.5
+0.050   0.00          0.0          1.0                0.5
+  TEST E PASSED
+
+  Test F -- augmentation ablation ('none' deterministic, 'conservative' varies, no flips):
+    'none': deterministic=True  'conservative': varies=True  blob position: original axis0=16, after conservative aug=12 (same side of center: True, shift=4 voxels -- no flip)
+  TEST F PASSED
+
+======================================================================
+  ALL SYNTHETIC SANITY CHECKS (A-F) PASSED ✓
+======================================================================
+  (No real dataset was loaded, nothing under baseline/, phase2/, or phase2/consistency/ was read or written. AnatomicalAttention itself was not modified -- ScalePreservingAnatomicalAttention is a separate, additional class.)
+exit: 0
+=== experimental_audit.py ===
+Device : cpu
+======================================================================
+  EXPERIMENTAL AUDIT MODULE -- SYNTHETIC SANITY CHECKS
+======================================================================
+
+  Test A -- baseline input audit (introspection, not prose):
+    ADHDNet multimodal=True  ADHDNetMRIOnly multimodal=False  ADHDProposedModelV2(default) multimodal=False
+  TEST A PASSED
+
+  Test B -- split identity verification (matching vs mismatched subject sets):
+    matching stage correctly identical: True  mismatched stage correctly flagged: True
+  TEST B PASSED
+
+  Test C -- TRM variant verification against a real (synthetic-data) training run:
+Device : cpu
+    A3's own real training-run artifacts all cross-check consistent: True
+    Deliberately mislabeled config correctly caught: config_kwargs_match_expected=False
+  TEST C PASSED
+
+  Test D -- log header/result alignment (the real run's A3/A4 artifact, reproduced):
+    Clean log: likely_console_log_artifact=False  Broken log (header dropped): likely_console_log_artifact=True, headers_missing=['A4 +MHA TRM (Phase 1)']
+  TEST D PASSED
+
+  Test E -- calibration metrics (ECE, Brier) + reliability diagram:
+    ECE(well-separated)=0.0500 < ECE(constant 0.9)=0.3800: True  reliability diagram written: True
+  TEST E PASSED
+
+  Test F -- ROC/PR comparison, probability distributions, per-class metrics:
+    AUROC=1.0000  AUPRC=1.0000  sensitivity=1.0000  specificity=0.9655
+  TEST F PASSED
+
+  Test G -- embedding extraction + collapse diagnostics (inference-only, no training):
+    embeddings shape=(12, 128)  effective_rank=8.59  class_separation_gap=0.0000  within_subject_stability=1.0000
+  TEST G PASSED
+
+  Test H -- fold trainer: fresh run, skip-if-complete, fingerprint guards:
+    Fresh run: status=fresh  Rerun (identical config): status=skipped
+    Changed index_hash correctly REFUSED: [testfold] REFUSING to reuse a fold result -- configuration has changed since it was produced:
+    Missing config_fingerprint correctly REFUSED: [testfold] REFUSING to reuse -- /tmp/exp_audit_foldout_kqs6gddz/testfold_config.json has no config_fingerprint (predates this safeguard, or was produced by a different module version), so there is no way to verify it matches the current configuration. Point OUT_DIR at a fresh, empty directory.
+  TEST H PASSED
+
+  Test I -- repeated-CV fold count + LOSO single-class-site exclusion:
+    6 CV folds (expected 6), LOSO sites included: ['loso_SiteA', 'loso_SiteB'], skipped (single-class): ['SiteOneClass']
+  TEST I PASSED
+
+  Test J -- run_controlled_comparison() end-to-end (tiny synthetic data, 1 model, 1 epoch):
+  2 repeated-CV folds + 2 LOSO folds (1 sites skipped for too few of one class: ['SiteOneClass'])
+    4 total folds run (expected 4), all fresh, SiteOneClass correctly excluded from LOSO
+    Summary:
+fold_type model_name  n_folds  auroc_mean  auroc_std  auroc_ci_low  auroc_ci_high  auprc_mean  auprc_std  auprc_ci_low  auprc_ci_high  accuracy_mean  accuracy_std  accuracy_ci_low  accuracy_ci_high  balanced_accuracy_mean  balanced_accuracy_std  balanced_accuracy_ci_low  balanced_accuracy_ci_high  sensitivity_mean  sensitivity_std  sensitivity_ci_low  sensitivity_ci_high  specificity_mean  specificity_std  specificity_ci_low  specificity_ci_high  f1_mean   f1_std  f1_ci_low  f1_ci_high
+       cv         A3        2    0.627976   0.122060     -0.468690       1.724643    0.565873   0.162186     -0.891307       2.023053           0.45      0.212132        -1.455931          2.355931                     0.5                    0.0                       0.5                        0.5               0.5         0.707107           -5.853102             6.853102               0.5         0.707107           -5.853102             6.853102 0.461538 0.000000   0.461538    0.461538
+     loso         A3        2    0.333333   0.117851     -0.725517       1.392184    0.483929   0.142263     -0.794255       1.762112           0.50      0.101015        -0.407586          1.407586                     0.5                    0.0                       0.5                        0.5               1.0         0.000000            1.000000             1.000000               0.0         0.000000            0.000000             0.000000 0.663636 0.089995  -0.144940    1.472213
+  TEST J PASSED
+
+  Test K -- every model spec (all 7) trains one fold end-to-end:
+    baseline_mri_only    params= 28,896  auroc=1.0000  status=fresh
+    A3                   params=105,424  auroc=0.5000  status=fresh
+    A4                   params=113,968  auroc=0.0000  status=fresh
+    A4-new               params=113,937  auroc=0.7500  status=fresh
+    A5-new               params=114,482  auroc=0.7500  status=fresh
+    M0                   params=114,482  auroc=0.7500  status=fresh
+    M1                   params=114,482  auroc=0.7500  status=fresh
+  TEST K PASSED
+
+  Test L -- collapse diagnostics distinguish global alignment from genuine collapse:
+    [global alignment] raw gap=0.0040  centered gap=1.5873  fisher_ratio=3.9529  projection_auc=1.0000  (correctly identified as NOT genuinely collapsed)
+    [genuine collapse] raw gap=0.0030  centered gap=0.0038  fisher_ratio=0.2440  projection_auc=0.5375  (correctly identified as genuinely collapsed -- no class signal to recover)
+  TEST L PASSED
+
+  Test M -- phenotype blindness, behavioral proof (item 3), all 7 specs + negative control:
+    baseline_mri_only    phenotype_blind=True  max_abs_diff=0.00e+00
+    A3                   phenotype_blind=True  max_abs_diff=0.00e+00
+    A4                   phenotype_blind=True  max_abs_diff=0.00e+00
+    A4-new               phenotype_blind=True  max_abs_diff=0.00e+00
+    A5-new               phenotype_blind=True  max_abs_diff=0.00e+00
+    M0                   phenotype_blind=True  max_abs_diff=0.00e+00
+    M1                   phenotype_blind=True  max_abs_diff=0.00e+00
+    ADHDNet (negative control) phenotype_blind=False  max_abs_diff=3.13e+00  (correctly phenotype-SENSITIVE)
+  TEST M PASSED
+
+  Test N -- fold distribution report (class + site counts, no train/val overlap):
+    fold cv00 (cv): n_train=13  n_val=7  subject_overlap=[]  val_class_counts={0: 4, 1: 3}
+  TEST N PASSED
+
+  Test O -- aggregate_fold_metrics() keeps repeated-CV and LOSO separate:
+    cv: n_folds=2  auroc_mean=0.7100  95% CI=[0.5829, 0.8371]  |  loso: n_folds=1  auroc_mean=0.5500  (kept in separate rows, never pooled)
+  TEST O PASSED
+
+  Test P -- site-stratified CV falls back to label-only for too-small sites:
+    sites fallen back to label-only: ['SiteOneClass'] (SiteOneClass correctly flagged)
+  TEST P PASSED
+
+  Test Q -- best predictions survive a resume that never re-beats the loaded best:
+  [resumefold] RESUMING from epoch 1
+    interrupted after epoch 1 (forced AUROC=0.99) -> resumed through epochs 2-4 (forced AUROC=0.10 each, never beating epoch 1): status=fresh, best_epoch=1 (correct), final OOF matches epoch 1's predictions (correct) -- no crash, no silently-wrong 'last epoch' predictions.
+  TEST Q PASSED
+
+======================================================================
+  ALL SYNTHETIC SANITY CHECKS (A-Q) PASSED ✓
+======================================================================
+  (No real dataset was loaded, nothing under baseline/, phase2/, or phase2/consistency/ was read or written. Section 4's harness is now implemented and unit-tested, but has NOT been run on real data.)
+exit: 0
