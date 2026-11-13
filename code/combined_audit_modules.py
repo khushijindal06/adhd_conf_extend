@@ -25,9 +25,12 @@ in code/ in this repo) -- each one's own
     python preprocessing_audit.py
     python architecture_audit.py
     python experimental_audit.py
-runs that module's own synthetic sanity suite correctly. This combined
-file exists only so a reviewer can scroll one document instead of
-opening three.
+runs that module's own synthetic sanity suite correctly -- including in
+a notebook cell (none of the three rely on `__file__`, which is
+undefined when code runs via a notebook's exec() rather than as a
+loaded module; preprocessing_audit.py's Test E was fixed this round to
+stop depending on it). This combined file exists only so a reviewer can
+scroll one document instead of opening three.
 
 Generated: 2026-11-13
 Source files, in order: preprocessing_audit.py, architecture_audit.py, experimental_audit.py
@@ -489,9 +492,20 @@ def run_sanity_check():
     print(f"    64^3 -> 96^3: voxel_count_ratio={cost['voxel_count_ratio']:.3f}  "
           f"linear_dimension_ratio={cost['linear_dimension_ratio']:.3f}")
 
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from phase2_model import ADHDProposedModelV2
+    # Relies on phase2_model.py already being importable from the current
+    # working directory / sys.path (true both when this file is run as a
+    # script from the same directory as the other pipeline files, and when
+    # it's pasted into a notebook cell whose working directory is set to
+    # that directory) -- deliberately does NOT use `__file__`, which is
+    # undefined when this code runs inside an exec'd notebook cell rather
+    # than as a loaded module, and would raise NameError there.
+    try:
+        from phase2_model import ADHDProposedModelV2
+    except ImportError as e:
+        raise ImportError(
+            "Could not import phase2_model.ADHDProposedModelV2 -- Test E needs it in the "
+            "same directory (or already on sys.path) as this file. If running from a "
+            "notebook, cd/sys.path.insert into that directory first.") from e
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
 
